@@ -21,3 +21,6 @@ Then open http://localhost:8000.
 - `respiradar/breathing.py`: pipeline IQ -> displacement -> rate -> alerts. The stages marked PLACEHOLDER are naive and meant to be replaced.
 - `respiradar/server.py`: reads the radar in a background thread and pushes JSON to the browser over `/ws` every 100 ms
 - `respiradar/static/index.html`: dashboard
+RespiRadar: HackMIT 2026 Project, healthcare track
+
+Board: SparkFun Pulsed Coherent Radar Sensor - Acconeer XM125 (sparkfun XM125 A121 Radar Breakout)
