@@ -12,8 +12,8 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
-from respiradar.breathing import BreathingPipeline
-from respiradar.sources import FRAME_RATE_HZ, radar_frames, simulated_frames
+from respiradar.breathing import BreathingPipeline, BreathingResult
+from respiradar.sources import RadarConfig, radar_frames, simulated_frames
 
 STATIC = Path(__file__).parent / "static"
 PUSH_INTERVAL_S = 0.1
@@ -22,13 +22,45 @@ app = FastAPI()
 latest: dict = {"status": "starting"}
 
 
+def to_payload(result: BreathingResult) -> dict:
+    """Shape a pipeline result for the browser dashboard."""
+    presence = result.presence
+    target = None
+    if result.distances_being_analyzed is not None:
+        low, high = result.distances_being_analyzed
+        target = float(presence.distances_m[(low + high) // 2])
+
+    events = []
+    if result.rate_bpm is not None and result.rate_bpm < 8:
+        events.append("low breathing rate")
+    if result.rate_bpm is not None and result.rate_bpm > 30:
+        events.append("high breathing rate")
+
+    return {
+        "t": result.t,
+        "app_state": result.app_state.value,
+        "distances_m": presence.distances_m.tolist(),
+        "range_profile": presence.score.tolist(),
+        "target_m": target,
+        "times": result.times.tolist(),
+        "displacement_mm": result.displacement_mm.tolist(),
+        "rate_bpm": result.rate_bpm,
+        "events": events,
+    }
+
+
 def acquisition_loop(port: str | None) -> None:
     global latest
+    config = RadarConfig()
     try:
-        frames = radar_frames(port) if port else simulated_frames()
-        pipeline = BreathingPipeline(FRAME_RATE_HZ)
+        frames = radar_frames(port, config=config) if port else simulated_frames(config)
+        pipeline = BreathingPipeline(config)
         for frame in frames:
-            latest = {"status": "running", "source": port or "simulator", **pipeline.process(frame)}
+            latest = {
+                "status": "running",
+                "source": port or "simulator",
+                **to_payload(pipeline.process(frame)),
+            }
     except Exception as e:
         traceback.print_exc()
         latest = {"status": f"error: {e}"}
