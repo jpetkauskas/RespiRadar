@@ -98,10 +98,22 @@ FEATURE_NAMES = [
 class FeatureExtractor:
     """Turns frames into the feature row used by every detector in the bake-off."""
 
+
     def __init__(self, config: RadarConfig, baseline_time_const_s: float = 45.0) -> None:
         self.config = config
         self.fs = config.frame_rate
         self.presence = PresenceDetector(config)
+        # Per-bin state, so the chest is chosen by how much it actually MOVES rather than by
+        # how brightly it reflects. See _select_chest_bin.
+        self.bin_amp: np.ndarray | None = None
+        self.bin_noise: np.ndarray | None = None
+        self.bin_angles: np.ndarray | None = None
+        self.bin_unwrapped: np.ndarray | None = None
+        self.bin_sos = None
+        self.bin_zi = None
+        self.bin_hist: list[np.ndarray] = []
+        self._last_bin = 0  # which range bin was judged to be the chest, for diagnostics
+        self.bin_slow: np.ndarray | None = None  # long-run motion per bin, for selection
 
         nyquist = self.fs / 2
         self.sos = signal.butter(
@@ -153,13 +165,86 @@ class FeatureExtractor:
         autocorr = float(np.max(ac[lo:hi])) if hi > lo else 0.0
         return flatness, autocorr
 
+    def _select_chest_bin(self, frame) -> int:
+        """Pick the range bin showing the most breathing-band MOTION, in millimetres.
+
+        The obvious choice - the presence detector's peak - is wrong on this hardware. Bin 0
+        sits at 0.30 m in the sensor's near field and reflects ~3200 against the chest's
+        ~500. Because the presence score divides by the noise floor, that bright static
+        reflection needs only a minuscule drift to outscore a real breathing chest, and it
+        won 50-99% of frames in every recording. Selecting on absolute millimetres of
+        band-limited motion instead, among bins whose reflection clears the noise, is
+        subject-independent physics: 0.15 mm and 1.5 mm differ by 10x whoever is lying there.
+        """
+        sweeps = frame.iq
+        mean_sweep = sweeps.mean(axis=0)
+        amplitude = np.abs(mean_sweep)
+        noise = (
+            np.abs(np.diff(sweeps, axis=0)).mean(axis=0) / np.sqrt(2)
+            if sweeps.shape[0] > 1
+            else np.ones_like(amplitude)
+        )
+        noise = np.maximum(noise, 1e-9)
+
+        if self.bin_amp is None:
+            n = len(mean_sweep)
+            self.bin_amp = amplitude
+            self.bin_noise = noise
+            self.bin_angles = np.angle(mean_sweep)
+            self.bin_unwrapped = np.zeros(n)
+            nyq = self.fs / 2
+            self.bin_sos = signal.butter(
+                2, [LOW_HZ / nyq, HIGH_HZ / nyq], btype="bandpass", output="sos"
+            )
+            self.bin_zi = np.zeros((self.bin_sos.shape[0], n, 2))
+        else:
+            self.bin_amp = 0.95 * self.bin_amp + 0.05 * amplitude
+            self.bin_noise = 0.95 * self.bin_noise + 0.05 * noise
+            angles = np.angle(mean_sweep)
+            step = (angles - self.bin_angles + np.pi) % (2 * np.pi) - np.pi
+            self.bin_unwrapped = self.bin_unwrapped + step
+            self.bin_angles = angles
+
+        # Shape (bins, 1): one new sample per bin, filtered along time (axis=1), so each
+        # range bin keeps its own filter state.
+        filtered, self.bin_zi = signal.sosfilt(
+            self.bin_sos, (self.bin_unwrapped * MM_PER_RADIAN)[:, None], zi=self.bin_zi, axis=1
+        )
+        self.bin_hist.append(filtered[:, 0])
+        if len(self.bin_hist) > int(8 * self.fs):
+            self.bin_hist.pop(0)
+
+        recent = np.asarray(self.bin_hist)
+        motion_mm = np.sqrt(np.mean(recent**2, axis=0))
+
+        # Selection must be SLOW. Choosing the bin with the most motion right now means that
+        # when breathing stops the selector goes hunting for whatever else is moving, so an
+        # apnea can never be observed - it simply re-points at a different bin. A 90 s time
+        # constant is dominated by normal breathing and barely moves during a 30 s hold.
+        if self.bin_slow is None:
+            self.bin_slow = motion_mm
+        else:
+            a = 1 / (90 * self.fs)
+            self.bin_slow = (1 - a) * self.bin_slow + a * motion_mm
+
+        # A chest is wider than one 6 cm range bin, so real breathing shows up across several
+        # adjacent bins at once. Averaging each bin with its neighbours rewards that and
+        # dilutes anything isolated - which is what the near-field clutter at 0.30 m is.
+        # Selecting on raw per-bin motion picks that clutter instead; an SNR gate does not
+        # help, because the chest's own reflection is weak (SNR < 1 at 0.8 m) while the
+        # clutter is bright.
+        spread = np.convolve(self.bin_slow, np.ones(3) / 3, mode="same")
+        self._last_bin = int(np.argmax(spread))
+        return self._last_bin
+
     def process(self, frame) -> np.ndarray:
         presence = self.presence.process(frame)
+        chest_bin = self._select_chest_bin(frame)
 
-        # Track the three range points around the person, weighted by reflected power.
+        # Track the three range points around the chest, weighted by reflected power.
         half = 1
         last = frame.iq.shape[1] - 1
-        low = int(np.clip(presence.peak_index - half, 0, max(last - 2, 0)))
+        low = int(np.clip(chest_bin - half, 0, max(last - 2, 0)))
         segment = frame.iq[:, low : low + 3].mean(axis=0)
         angles = np.angle(segment)
         amplitude = np.abs(segment)
