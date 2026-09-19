@@ -33,6 +33,60 @@ entirely changes nothing. Generalising across bodies is the difficulty.
 For context, the detector this replaced scores **0 of 2** on nishant: it alarms once, 1.4 s
 after he resumed breathing.
 
+## Bake-off results
+
+Six approaches, identical folds, identical metrics. Sorted by the priority order above:
+
+| detector | holds | worst latency | median | false alarms |
+|---|---|---|---|---|
+| **changepoint/cusum-bank-conservative** | **3/4** | **22.0 s** | 20.5 s | **0** |
+| spectral/range-stft | 3/4 | 30.8 s | 30.1 s | 0 |
+| changepoint/cusum-bank | **4/4** | 23.4 s | 19.2 s | 3 |
+| anomaly/one-sided-maha | 2/4 | 33.1 s | 29.8 s | 2 |
+| breathgap/time-since-breath | 1/4 | 35.5 s | 35.5 s | 1 |
+| temporal/stacked-window | 2/4 | 45.0 s | 33.3 s | 9 |
+| baseline/energy-threshold | 2/4 | 8.2 s | 7.6 s | 16 |
+
+**Recommended: `cusum-bank-conservative`.** Sequential change detection is built to minimise
+detection delay at a fixed false-alarm rate, which is this problem's objective function
+stated exactly. `cusum-bank` catches all four holds but talks three times in 19 minutes.
+
+### What every approach independently agreed on
+
+Four entries arrived at these separately, which is worth more than any single result:
+
+1. **Subject-relative features transfer; absolute ones do not.** Dropping raw amplitudes for
+   dimensionless ratios was the largest cross-subject gain every entry found.
+2. **The supplied `baseline` ratchets** to a subject's *best* breathing, so shallow stretches
+   sit below it forever and read as apnea. A trailing low quantile (25th percentile over
+   60-120 s) beat it everywhere. This is a defect in the shared feature and should be fixed.
+3. **Simple statistics beat flexible models.** Every multivariate model lost to a 1-D
+   statistic. Gradient boosting and logistic regression saturate at probability 1.000 on a
+   new subject's *negatives*; only bagged forests kept their ordering. With four events,
+   capacity is a liability.
+4. **Both first holds are undetectable** and are below the noise, not below a threshold.
+
+### Sub-10 s is not reachable here at zero false alarms
+
+The baseline reaches 8.2 s and pays 16 false alarms. A ratio-only CUSUM chart detects two
+holds at 4.0 s and 1.7 s and costs 25. Negatives overlap positives frame-for-frame: a model
+fitted on everything scores a labelled *negative* stretch higher than the first six seconds of
+a real hold. Duration is the only separator, and duration is latency.
+
+Two of the four holds also start inside the 25 s scoring warmup, which puts a floor of 20.4 s
+on justinas's first hold alone. Worst-case latency is close to saturated; median latency is
+the number with room left in it.
+
+## A flaw in this harness, found by one of the entries
+
+Folds were originally built only for subjects who had labelled holds, so vishnu - who only
+breathes normally - was permanently in the training set and his false alarms were never
+counted. Staying quiet on an unseen body is the single most important property, and it was
+the one thing not being measured.
+
+Two entries reported zero false alarms and in fact had **two and nine**. Every subject now
+gets a fold, whether or not they hold their breath.
+
 ## Open question: justinas's hold labels look about 20 s early
 
 Comparing the labelled hold windows against the band-passed breathing envelope, and sweeping
