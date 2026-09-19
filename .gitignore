@@ -8,3 +8,6 @@ __pycache__/
 *.egg-info/
 
 # Recorded training sessions (datalog.py)
+
+# derived feature cache, rebuilt with `python -m respiradar.dataset`
+data/*.npz
