@@ -13,7 +13,7 @@ Runs on macOS, which Acconeer's own Exploration Tool does not officially support
 no venv to create or activate.
 
 ```
-uv run python main.py --baudrate 230400
+uv run python main.py
 ```
 
 That's the whole setup. First run resolves dependencies and refreshes `uv.lock`, which takes
@@ -21,8 +21,9 @@ a minute; after that it's instant. Commit the refreshed lock so everyone matches
 
 ```
 uv run python main.py --list-ports          # find the COM port
-uv run python main.py --baudrate 230400     # auto-detects the board by its CH340 USB id
-uv run python main.py --port COM6 --baudrate 230400
+uv run python main.py                       # auto-detects the board by its CH340 USB id
+uv run python main.py --port COM6
+uv run python main.py --baudrate 115200     # if 230400 proves unstable
 uv run python main.py --simulate --bpm 18   # no hardware
 uv run python main.py --replay tests/data/breathing-sitting.h5
 uv run --extra dev pytest tests/ -q         # the test suite
@@ -30,8 +31,8 @@ uv run --extra dev pytest tests/ -q         # the test suite
 
 **Close the Acconeer Exploration Tool first** — only one program can hold the port.
 
-230400 is the baud we know this board is stable at. `main.py` sizes the sensor config to fit
-it automatically (20 Hz / 8 sweeps); see the table below.
+230400 is the default, being the rate this board has proven stable at. `main.py` sizes the
+sensor config to fit it automatically (20 Hz / 8 sweeps); see the table below.
 
 ### macOS (venv)
 
@@ -53,7 +54,7 @@ python main.py                      # auto-detect, or simulate
 python main.py --simulate --bpm 18  # no hardware
 python main.py --replay tests/data/breathing-sitting.h5
 python main.py --list-ports
-python main.py --port /dev/cu.wchusbserial1420 --baudrate 115200
+python main.py --port /dev/cu.wchusbserial1420 --baudrate 115200  # slower, safer
 ```
 
 ## macOS setup
@@ -65,8 +66,9 @@ the port (close the Exploration Tool first).
    and **reboot**. macOS's built-in USB-to-UART driver is unreliable with this board; this is
    the single reason Acconeer calls macOS unsupported. A `/dev/cu.wchusbserial*` appears after.
 2. `python main.py --list-ports` to confirm it's there.
-3. Start at `--baudrate 115200`. Acconeer's default auto-baud of 2 Mbps exceeds what this
-   board does reliably, and the failure looks like corrupted data rather than a clean error.
+3. The default is 230400. If the link misbehaves, drop to `--baudrate 115200`. Acconeer's
+   own auto-baud of 2 Mbps exceeds what this board does reliably, and that failure looks like
+   corrupted data rather than a clean error.
 
 Symptom when the driver is missing: `LinkError: recv timeout`. We confirmed the board is
 completely silent in that state — no bytes at 9600 through 2000000 baud, with flow control on

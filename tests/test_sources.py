@@ -41,3 +41,14 @@ def test_default_config_covers_the_requested_range():
 
     assert config.num_points == 21
     assert config.distances_m[-1] <= config.end_m
+
+
+def test_default_baudrate_leaves_room_for_a_usable_frame_rate():
+    """230400 is the board's proven-stable rate; the shipped config must fit inside it."""
+    from main import DEFAULT_BAUDRATE, fit_config
+    from respiradar.sources import RadarConfig
+
+    fitted = fit_config(RadarConfig(), DEFAULT_BAUDRATE)
+
+    assert fitted.fits_in(DEFAULT_BAUDRATE)
+    assert fitted.frame_rate >= 10.0  # Nyquist for 40 bpm with margin to filter

@@ -26,7 +26,8 @@ from respiradar.sources import (
     simulated_frames,
 )
 
-DEFAULT_BAUDRATE = 115200
+# The rate this board has proven stable at. Drop to 115200 if the link misbehaves.
+DEFAULT_BAUDRATE = 230400
 
 
 def list_ports() -> int:
