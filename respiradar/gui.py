@@ -23,16 +23,22 @@ STATE_COLOUR = {
     AppState.NO_PRESENCE: "#888888",
     AppState.DETERMINE_DISTANCE: "#d08b00",
     AppState.ESTIMATE_BREATHING_RATE: "#1f9d55",
+    AppState.APNEA: "#d62728",
 }
 
 
 class Acquisition(threading.Thread):
     """Runs the source and the pipeline, keeping only the newest result."""
 
-    def __init__(self, frames: Callable[[], Iterator[Frame]], config: RadarConfig) -> None:
+    def __init__(
+        self,
+        frames: Callable[[], Iterator[Frame]],
+        config: RadarConfig,
+        apnea_s: float = 10.0,
+    ) -> None:
         super().__init__(daemon=True)
         self.frames = frames
-        self.pipeline = BreathingPipeline(config)
+        self.pipeline = BreathingPipeline(config, apnea_s=apnea_s)
         self.latest: BreathingResult | None = None
         self.error: str | None = None
         self.delayed_frames = 0
@@ -65,6 +71,7 @@ class Dashboard(QtWidgets.QMainWindow):
         self.resize(900, 1000)
 
         central = QtWidgets.QWidget()
+        self.central = central
         layout = QtWidgets.QVBoxLayout(central)
         self.setCentralWidget(central)
 
@@ -122,6 +129,22 @@ class Dashboard(QtWidgets.QMainWindow):
         self.rate_plot.showGrid(x=True, y=True, alpha=0.2)
         self.rate_curve = self.rate_plot.plot(pen=pg.mkPen("#1f9d55", width=2))
 
+        # 5. The anomaly score: breathing strength relative to this person's own baseline.
+        self.ratio_plot = win.addPlot(row=4, col=0)
+        self.ratio_plot.setTitle("Breathing vs. personal baseline")
+        self.ratio_plot.setLabel("left", "Ratio")
+        self.ratio_plot.setLabel("bottom", "Time (s)")
+        self.ratio_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.ratio_plot.setYRange(0, 2)
+        self.ratio_curve = self.ratio_plot.plot(pen=pg.mkPen("#1f77b4", width=2))
+        self.ratio_plot.addItem(
+            pg.InfiniteLine(
+                pos=acquisition.pipeline.apnea_ratio,
+                angle=0,
+                pen=pg.mkPen("#d62728", width=1, style=QtCore.Qt.DashLine),
+            )
+        )
+
         self.status = self.statusBar()
 
         self.timer = QtCore.QTimer(self)
@@ -157,16 +180,30 @@ class Dashboard(QtWidgets.QMainWindow):
             self.psd_curve.setData(result.psd_freqs_hz * 60, result.psd)
         if len(result.rate_history):
             self.rate_curve.setData(result.rate_times, result.rate_history)
+        self.ratio_curve.setData(result.ratio_times, result.ratio_history)
 
-        self.state_label.setText(result.app_state.value)
+        state_text = result.app_state.value
+        if result.breathing_ratio is not None:
+            state_text += f"  -  breathing at {100 * result.breathing_ratio:.0f}% of baseline"
+        if result.quiet_s > 0:
+            state_text += f"  -  no breathing for {result.quiet_s:.0f} s"
+        self.state_label.setText(state_text)
         self.state_label.setStyleSheet(
             f"font-size: 16px; color: {STATE_COLOUR[result.app_state]};"
         )
 
-        if result.rate_bpm is None:
+        apnea = result.app_state == AppState.APNEA
+        self.central.setStyleSheet("background: #5c1010;" if apnea else "")
+        if apnea:
+            self.rate_label.setText(f"APNEA  {result.quiet_s:.0f} s")
+            self.rate_label.setStyleSheet("font-size: 54px; font-weight: 600; color: #ff5252;")
+            self.psd_marker.hide()
+        elif result.rate_bpm is None:
+            self.rate_label.setStyleSheet("font-size: 54px; font-weight: 600;")
             self.rate_label.setText("--")
             self.psd_marker.hide()
         else:
+            self.rate_label.setStyleSheet("font-size: 54px; font-weight: 600;")
             self.rate_label.setText(f"{result.rate_bpm:.1f} bpm")
             self.psd_marker.setPos(result.rate_bpm)
             self.psd_marker.show()
@@ -183,10 +220,15 @@ class Dashboard(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
 
-def run(frames: Callable[[], Iterator[Frame]], config: RadarConfig, source_name: str) -> int:
+def run(
+    frames: Callable[[], Iterator[Frame]],
+    config: RadarConfig,
+    source_name: str,
+    apnea_s: float = 10.0,
+) -> int:
     pg.setConfigOptions(antialias=True)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    acquisition = Acquisition(frames, config)
+    acquisition = Acquisition(frames, config, apnea_s=apnea_s)
     acquisition.start()
     window = Dashboard(acquisition, config, source_name)
     window.show()

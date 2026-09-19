@@ -12,7 +12,7 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
-from respiradar.breathing import BreathingPipeline, BreathingResult
+from respiradar.breathing import AppState, BreathingPipeline, BreathingResult
 from respiradar.sources import RadarConfig, radar_frames, simulated_frames
 
 STATIC = Path(__file__).parent / "static"
@@ -31,6 +31,8 @@ def to_payload(result: BreathingResult) -> dict:
         target = float(presence.distances_m[(low + high) // 2])
 
     events = []
+    if result.app_state == AppState.APNEA:
+        events.append(f"APNEA: no breathing for {result.quiet_s:.0f} s")
     if result.rate_bpm is not None and result.rate_bpm < 8:
         events.append("low breathing rate")
     if result.rate_bpm is not None and result.rate_bpm > 30:
@@ -45,6 +47,8 @@ def to_payload(result: BreathingResult) -> dict:
         "times": result.times.tolist(),
         "displacement_mm": result.displacement_mm.tolist(),
         "rate_bpm": result.rate_bpm,
+        "breathing_ratio": result.breathing_ratio,
+        "quiet_s": result.quiet_s,
         "events": events,
     }
 

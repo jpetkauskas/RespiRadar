@@ -168,10 +168,13 @@ def simulated_frames(
     breaths_per_min: float | None = 14.0,
     target_m: float = 0.8,
     realtime: bool = True,
+    holds: tuple[tuple[float, float], ...] = (),
 ) -> Iterator[Frame]:
     """Fake a chest at `target_m` moving ~4 mm peak-to-peak, plus static clutter and noise.
 
     Pass `breaths_per_min=None` for an empty room: clutter and noise, nobody there.
+    `holds` is a list of (start_s, duration_s) breath-holds: the person stays in place but
+    the chest stops moving, as in an apnea.
     """
     config = config or RadarConfig()
     distances = config.distances_m
@@ -184,7 +187,11 @@ def simulated_frames(
         if breaths_per_min is None:
             chest = np.zeros_like(distances, dtype=complex)
         else:
-            displacement = 0.002 * np.sin(2 * np.pi * breaths_per_min / 60 * t)
+            breathing_t = t
+            for start, duration in holds:
+                if start <= t < start + duration:
+                    breathing_t = start  # chest frozen where it was when the hold began
+            displacement = 0.002 * np.sin(2 * np.pi * breaths_per_min / 60 * breathing_t)
             phase = 4 * np.pi * displacement / WAVELENGTH_M
             chest = 1000 * envelope * np.exp(1j * phase)
         static = 300 * np.exp(1j * distances * 50)

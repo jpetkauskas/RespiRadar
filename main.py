@@ -86,7 +86,21 @@ def main() -> int:
     parser.add_argument("--list-ports", action="store_true")
     parser.add_argument("--frame-rate", type=float)
     parser.add_argument("--sweeps", type=int)
+    parser.add_argument(
+        "--apnea-seconds",
+        type=float,
+        default=10.0,
+        help="seconds without breathing before the apnea alarm (clinical definition: 10)",
+    )
+    parser.add_argument(
+        "--hold",
+        action="append",
+        default=[],
+        metavar="START:DURATION",
+        help="simulator breath-hold, e.g. --hold 40:25 (repeatable)",
+    )
     args = parser.parse_args()
+    holds = tuple(tuple(float(x) for x in h.split(":")) for h in args.hold)
 
     if args.list_ports:
         return list_ports()
@@ -94,7 +108,7 @@ def main() -> int:
     if args.replay:
         config = recorded_config(args.replay)
         frames = partial(replay_frames, args.replay, realtime=True)
-        return gui.run(frames, config, f"replay: {args.replay}")
+        return gui.run(frames, config, f"replay: {args.replay}", args.apnea_seconds)
 
     overrides = {}
     if args.frame_rate:
@@ -109,8 +123,10 @@ def main() -> int:
         if not args.simulate:
             print("No radar found - running the simulator instead.")
             print("Plug in the XM125, or run `python main.py --list-ports` to look for it.\n")
-        frames = partial(simulated_frames, config, breaths_per_min=args.bpm, realtime=True)
-        return gui.run(frames, config, f"simulator @ {args.bpm:.0f} bpm")
+        frames = partial(
+            simulated_frames, config, breaths_per_min=args.bpm, realtime=True, holds=holds
+        )
+        return gui.run(frames, config, f"simulator @ {args.bpm:.0f} bpm", args.apnea_seconds)
 
     config = fit_config(config, args.baudrate)
     print(f"Connecting to {port} at {args.baudrate} baud...")
@@ -121,7 +137,7 @@ def main() -> int:
         baudrate=args.baudrate,
         flow_control=not args.no_flow_control,
     )
-    return gui.run(frames, config, port)
+    return gui.run(frames, config, port, args.apnea_seconds)
 
 
 if __name__ == "__main__":

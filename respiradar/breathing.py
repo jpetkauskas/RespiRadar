@@ -27,12 +27,14 @@ from respiradar.presence import PresenceDetector, PresenceResult
 from respiradar.sources import WAVELENGTH_M, Frame, RadarConfig
 
 MM_PER_RADIAN = WAVELENGTH_M / (4 * np.pi) * 1000
+RATIO_HISTORY_S = 90.0
 
 
 class AppState(Enum):
     NO_PRESENCE = "No presence detected"
     DETERMINE_DISTANCE = "Determining distance"
     ESTIMATE_BREATHING_RATE = "Estimating breathing rate"
+    APNEA = "APNEA: no breathing"
 
 
 @dataclass
@@ -48,6 +50,12 @@ class BreathingResult:
     rate_bpm: float | None = None
     rate_history: np.ndarray = field(default_factory=lambda: np.empty(0))
     rate_times: np.ndarray = field(default_factory=lambda: np.empty(0))
+    # Recent breathing strength as a fraction of this person's own baseline. None until a
+    # baseline exists. This is the anomaly score: ~1 is normal, near 0 is no breathing.
+    breathing_ratio: float | None = None
+    ratio_history: np.ndarray = field(default_factory=lambda: np.empty(0))
+    ratio_times: np.ndarray = field(default_factory=lambda: np.empty(0))
+    quiet_s: float = 0.0  # how long breathing has been below the apnea threshold
     delayed: bool = False
 
 
@@ -61,6 +69,11 @@ class BreathingPipeline:
         distance_determination_duration_s: float = 5.0,
         num_distances_to_analyze: int = 3,
         presence: PresenceDetector | None = None,
+        apnea_s: float = 10.0,
+        apnea_ratio: float = 0.3,
+        max_still_s: float = 60.0,
+        strength_window_s: float = 3.0,
+        baseline_time_const_s: float = 30.0,
     ) -> None:
         self.config = config
         self.fs = config.frame_rate
@@ -68,6 +81,11 @@ class BreathingPipeline:
         self.high_hz = highest_breathing_rate / 60
         self.num_distances = num_distances_to_analyze
         self.presence = presence or PresenceDetector(config)
+
+        self.apnea_s = apnea_s
+        self.apnea_ratio = apnea_ratio
+        self.max_still_s = max_still_s
+        self.baseline_alpha = 1 / (baseline_time_const_s * self.fs)
 
         self.window_length = int(time_series_length_s * self.fs)
         self.determination_frames = int(distance_determination_duration_s * self.fs)
@@ -95,6 +113,17 @@ class BreathingPipeline:
             output="sos",
         )
 
+        # Breathing strength, measured causally so it responds the moment breathing stops.
+        self.sos_state = np.zeros((self.sos.shape[0], 2))
+        self.recent_filtered: deque[float] = deque(maxlen=int(strength_window_s * self.fs))
+        self.baseline_strength: float | None = None
+        self.ratio: float | None = None
+        self.ratio_history: deque[float] = deque(maxlen=int(RATIO_HISTORY_S * self.fs))
+        self.ratio_times: deque[float] = deque(maxlen=int(RATIO_HISTORY_S * self.fs))
+        self.quiet_since: float | None = None
+        self.absent_since: float | None = None
+        self.last_quiet_t: float | None = None
+
     def _reset_tracking(self) -> None:
         self.times.clear()
         self.displacement.clear()
@@ -104,6 +133,56 @@ class BreathingPipeline:
         self.unwrapped = None
         self.amplitude = None
         self.rate_bpm = None
+        self.sos_state = np.zeros((self.sos.shape[0], 2))
+        self.recent_filtered.clear()
+        self.baseline_strength = None
+        self.ratio = None
+        self.ratio_history.clear()
+        self.ratio_times.clear()
+        self.quiet_since = None
+        self.last_quiet_t = None
+
+    def _update_breathing_strength(self, t: float) -> None:
+        """Compare recent breathing motion with this person's own baseline.
+
+        No training data involved: the first stretch of steady breathing *is* the model of
+        normal, and an apnea is a sustained collapse relative to it.
+        """
+        filtered, self.sos_state = signal.sosfilt(
+            self.sos, [self.displacement[-1]], zi=self.sos_state
+        )
+        self.recent_filtered.append(float(filtered[0]))
+        if len(self.recent_filtered) < self.recent_filtered.maxlen:
+            return
+        strength = float(np.sqrt(np.mean(np.square(self.recent_filtered))))
+
+        # Start the baseline only once the rate estimator trusts it is looking at a chest,
+        # so noise from an empty room never becomes "normal".
+        if self.baseline_strength is None:
+            if self.rate_bpm is None:
+                return
+            self.baseline_strength = strength
+
+        self.ratio = strength / max(self.baseline_strength, 1e-9)
+        self.ratio_history.append(self.ratio)
+        self.ratio_times.append(t)
+
+        # Judge on breathing strength alone: the presence score can dip below its threshold
+        # during quiet but perfectly normal breathing, and that must not count as apnea.
+        if self.ratio < self.apnea_ratio:
+            if self.quiet_since is None:
+                self.quiet_since = t
+            self.last_quiet_t = t
+        else:
+            self.quiet_since = None
+            # Adapt to the person only while they are clearly breathing, so a gradual
+            # decline is not silently absorbed as the new normal.
+            if self.ratio > 0.6:
+                a = self.baseline_alpha
+                self.baseline_strength = (1 - a) * self.baseline_strength + a * strength
+
+    def _quiet_s(self, t: float) -> float:
+        return 0.0 if self.quiet_since is None else t - self.quiet_since
 
     def _select_distances(self, peak_index: int) -> tuple[int, int]:
         half = self.num_distances // 2
@@ -169,7 +248,22 @@ class BreathingPipeline:
     def process(self, frame: Frame) -> BreathingResult:
         presence = self.presence.process(frame)
 
-        if not presence.detected:
+        # A person who stops breathing stops moving, and to a motion-based presence detector
+        # that is indistinguishable from an empty bed. So once we have a breathing baseline,
+        # losing presence means "possible apnea" and we keep tracking the chest. Only a long
+        # stillness is taken to mean the person has actually left.
+        if presence.detected:
+            self.absent_since = None
+        elif self.absent_since is None:
+            self.absent_since = frame.t
+        still_s = 0.0 if self.absent_since is None else frame.t - self.absent_since
+        still_but_tracked = (
+            not presence.detected
+            and self.baseline_strength is not None
+            and still_s < self.max_still_s
+        )
+
+        if not presence.detected and not still_but_tracked:
             self.app_state = AppState.NO_PRESENCE
             self.frames_with_presence = 0
             self.distances_being_analyzed = None
@@ -189,8 +283,13 @@ class BreathingPipeline:
         if self.distances_being_analyzed is None:
             self.distances_being_analyzed = self._select_distances(presence.peak_index)
 
-        self.app_state = AppState.ESTIMATE_BREATHING_RATE
         self._update_displacement(frame)
+        self._update_breathing_strength(frame.t)
+        quiet_s = self._quiet_s(frame.t)
+        if quiet_s >= self.apnea_s:
+            self.app_state = AppState.APNEA
+        else:
+            self.app_state = AppState.ESTIMATE_BREATHING_RATE
 
         freqs = np.empty(0)
         psd = np.empty(0)
@@ -199,7 +298,13 @@ class BreathingPipeline:
             band = (freqs >= self.low_hz) & (freqs <= self.high_hz)
             freqs, psd = freqs[band], psd[band]
             rate = self._estimate_rate()
-            if rate is not None:
+            # A window containing a pause has no meaningful rate (the flat stretch reads as a
+            # very slow breath), so hold the last rate until the pause has scrolled out.
+            window_is_clean = (
+                self.last_quiet_t is None
+                or frame.t - self.last_quiet_t > self.window_length / self.fs
+            )
+            if rate is not None and window_is_clean:
                 # Smooth: breathing rate cannot jump, so a sudden change is an artefact.
                 self.rate_bpm = rate if self.rate_bpm is None else 0.9 * self.rate_bpm + 0.1 * rate
                 self.rate_history.append(self.rate_bpm)
@@ -217,6 +322,10 @@ class BreathingPipeline:
             rate_bpm=self.rate_bpm,
             rate_history=np.asarray(self.rate_history),
             rate_times=np.asarray(self.rate_times),
+            breathing_ratio=self.ratio,
+            ratio_history=np.asarray(self.ratio_history),
+            ratio_times=np.asarray(self.ratio_times),
+            quiet_s=quiet_s,
             delayed=frame.delayed,
         )
 

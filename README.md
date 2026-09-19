@@ -57,6 +57,22 @@ python main.py --list-ports
 python main.py --port /dev/cu.wchusbserial1420 --baudrate 115200  # slower, safer
 ```
 
+## Apnea demo
+
+No training data needed: the first ~25 s of steady breathing becomes the person's own
+baseline, and the "Breathing vs. personal baseline" plot is the anomaly score. Breathing
+below 30% of baseline for `--apnea-seconds` (default 10) raises the alarm.
+
+```
+uv run python main.py --simulate --hold 40:25       # rehearse: 25 s breath-hold at t=40 s
+uv run python main.py --baudrate 230400             # live: lie still ~30 s, then hold your breath
+```
+
+Expect the alarm about 13 s into the hold: ~3 s for breathing strength to fall, then 10 s
+of sustained absence. Hold for 20 s or more; for a snappier demo use `--apnea-seconds 6`.
+Stay still during the hold - moving is motion, not apnea. The pipeline assumes the person
+has left only after 60 s without any detected presence.
+
 ## macOS setup
 
 The XM125 must be running Acconeer's Exploration Server firmware, and nothing else may hold
