@@ -73,6 +73,39 @@ of sustained absence. Hold for 20 s or more; for a snappier demo use `--apnea-se
 Stay still during the hold - moving is motion, not apnea. The pipeline assumes the person
 has left only after 60 s without any detected presence.
 
+## Recording training data
+
+`datalog.py` saves the raw sensor output, untouched, with a label. That output is complex
+I/Q per range bin (21 bins, 0.3-1.5 m) per sweep per frame. Breathing is in the phase of
+the I/Q, so this is everything a model needs. Distance is just the bin index.
+
+```
+uv run python datalog.py sleeping --subject justinas                 # 3 min (default)
+uv run python datalog.py talking --subject justinas --seconds 300
+uv run python datalog.py breath-hold --subject justinas              # Enter at each hold start and end
+uv run python datalog.py sleeping --subject justinas --seconds 0     # until Ctrl+C
+uv run python main.py --replay data/justinas_sleeping_<time>.h5      # watch a recording back
+```
+
+Suggested labels: `sleeping`, `resting`, `talking`, `active`, `breath-hold`, `empty` (nobody
+there, so a model learns what absence looks like). Each run writes
+`data/<subject>_<label>_<time>.h5` (Acconeer's own format, written as it goes) and adds a
+row to `data/sessions.csv`. Recordings are git-ignored.
+
+- **Rate:** the UART is the limit, not the sensor. At 230400 baud the logger uses 20 Hz
+  x 8 sweeps. That is 20x the fastest breathing, and fast enough for talking and fidgeting.
+  `--frame-rate`/`--sweeps` trade one for the other. The live readout warns if frames
+  arrive late.
+- **Countdown:** the first 5 s (`--countdown`) give you time to get in position. They stay
+  in the file but come before `start_frame`, so they are unlabelled.
+- **Markers:** Enter drops a timestamp, in seconds from `start_frame`. For breath-holds,
+  press it when you stop breathing and again when you start. Hold for 20-40 s at a time
+  and breathe normally in between.
+- **Checking position:** the live readout runs the breathing pipeline. If it never gets
+  past "No presence detected", the chest is out of range or the radar is pointed wrong.
+- **Dry run:** `--mock` records from Acconeer's mock sensor to test the logger without
+  hardware.
+
 ## macOS setup
 
 The XM125 must be running Acconeer's Exploration Server firmware, and nothing else may hold

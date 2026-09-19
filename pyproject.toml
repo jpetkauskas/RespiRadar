@@ -25,3 +25,6 @@ packages = ["respiradar"]
 
 [tool.setuptools.package-data]
 respiradar = ["static/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]  # so tests can import the top-level scripts (main.py, datalog.py)

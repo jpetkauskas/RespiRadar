@@ -1,8 +1,10 @@
 __pycache__/
 *.pyc
 .venv/
-*.h5
+
 
 # ...but the Acconeer validation recordings the tests need must be committed
 !tests/data/*.h5
 *.egg-info/
+
+# Recorded training sessions (datalog.py)

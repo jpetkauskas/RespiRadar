@@ -124,8 +124,13 @@ def radar_frames(
     config: RadarConfig | None = None,
     baudrate: int | None = None,
     flow_control: bool = True,
+    record_to: Path | str | None = None,
 ) -> Iterator[Frame]:
-    """Stream sparse IQ from an XM125 running Acconeer's Exploration Server firmware."""
+    """Stream sparse IQ from an XM125 running Acconeer's Exploration Server firmware.
+
+    `record_to` also saves every frame, untouched, to an Acconeer .h5 file (the same format
+    `replay_frames` reads). Pass `port="mock"` for Acconeer's hardware-free mock server.
+    """
     from acconeer.exptool import a121
 
     config = config or RadarConfig()
@@ -140,13 +145,18 @@ def radar_frames(
     )
     distances = config.distances_m
 
-    client = a121.Client.open(
-        serial_port=port,
-        override_baudrate=baudrate,
-        flow_control=flow_control,
-    )
+    if port == "mock":
+        client = a121.Client.open(mock=True)
+    else:
+        client = a121.Client.open(
+            serial_port=port,
+            override_baudrate=baudrate,
+            flow_control=flow_control,
+        )
     print(f"Connected: {client.server_info}")
     client.setup_session(sensor_config)
+    # The recorder writes to disk as it goes, so a crash loses at most the last second.
+    recorder = a121.H5Recorder(str(record_to), client) if record_to else None
     client.start_session()
     t0 = time.monotonic()
     try:
@@ -160,6 +170,8 @@ def radar_frames(
             )
     finally:
         client.stop_session()
+        if recorder is not None:
+            recorder.close()
         client.close()
 
 
