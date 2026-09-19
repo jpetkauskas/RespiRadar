@@ -80,4 +80,22 @@ def test_folds_never_train_on_the_subject_they_test():
         tested = {subject_of[c.name.split("[")[0]] for c in test}
 
         assert not (trained & tested)
-        assert any(c.holds for c in test)
+
+
+def test_every_subject_is_held_out_by_some_fold():
+    """Including subjects with no holds.
+
+    A subject who only ever breathes normally still tests the property that matters most:
+    staying quiet on a body the detector has never seen. Keeping such a subject permanently
+    in the training set hides their false alarms entirely - two entries in the bake-off
+    reported zero false alarms and actually had two and nine.
+    """
+    from respiradar.bakeoff import folds
+    from respiradar.dataset import SESSIONS, subjects
+
+    subject_of = {s.name: s.subject for s in SESSIONS}
+    held_out = {
+        subject_of[c.name.split("[")[0]] for _, test in folds() for c in test
+    }
+
+    assert held_out == set(subjects())
