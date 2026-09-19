@@ -9,4 +9,19 @@ dependencies = [
     "scipy",
     "fastapi",
     "uvicorn[standard]",
+    "pyqtgraph",
+    "PySide6",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["respiradar"]
+
+[tool.setuptools.package-data]
+respiradar = ["static/*"]
