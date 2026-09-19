@@ -47,3 +47,37 @@ def test_features_are_finite(sleeping_session):
     _, X, _ = sleeping_session
 
     assert np.isfinite(X).all()
+
+
+def test_ratio_features_never_explode():
+    """The baseline used to latch onto a filter transient, sending ratios to ~2.6e8.
+
+    Any model that scales its inputs is wrecked by an outlier that large, and the bad values
+    persisted well past the scoring warmup, so this is checked on every session.
+    """
+    from respiradar.dataset import SESSIONS, load_cached
+
+    ratio = FEATURE_NAMES.index("ratio_4s")
+    for session in SESSIONS:
+        _, X, _ = load_cached(session.name)
+        assert X[:, ratio].max() <= 10.0, session.name
+
+
+def test_every_subject_is_represented():
+    from respiradar.dataset import subjects
+
+    assert subjects() == ["justinas", "nishant", "vishnu"]
+
+
+def test_folds_never_train_on_the_subject_they_test():
+    """Leave-one-subject-out is the only split that predicts behaviour on a new person."""
+    from respiradar.bakeoff import folds
+    from respiradar.dataset import SESSIONS
+
+    subject_of = {s.name: s.subject for s in SESSIONS}
+    for train, test in folds():
+        trained = {subject_of[c.name.split("[")[0]] for c in train}
+        tested = {subject_of[c.name.split("[")[0]] for c in test}
+
+        assert not (trained & tested)
+        assert any(c.holds for c in test)

@@ -33,6 +33,7 @@ HIGH_HZ = 40 / 60
 class Session:
     name: str
     filename: str
+    subject: str = "nishant"
     holds: list[Episode] = field(default_factory=list)
     description: str = ""
 
@@ -42,23 +43,33 @@ class Session:
 
 
 SESSIONS: list[Session] = [
-    Session(
-        "sleeping",
-        "nishant_sleeping_20260919-182058.h5",
-        description="lying still, breathing normally",
-    ),
-    Session(
-        "noisy",
-        "nishant_noisy_20260919-181623.h5",
-        description="talking and moving - must never alarm",
-    ),
-    Session(
-        "breath-hold",
-        "nishant_breath-hold_20260919-182741.h5",
-        holds=[Episode(14.3, 41.4), Episode(73.2, 116.4)],
-        description="breathe, hold, breathe, hold",
-    ),
+    # nishant. The first three names predate the multi-subject recordings and are kept as
+    # they are so existing code and detectors continue to resolve them.
+    Session("sleeping", "nishant_sleeping_20260919-182058.h5", "nishant",
+            description="lying still, breathing normally"),
+    Session("noisy", "nishant_noisy_20260919-181623.h5", "nishant",
+            description="talking and moving - must never alarm"),
+    Session("breath-hold", "nishant_breath-hold_20260919-182741.h5", "nishant",
+            holds=[Episode(14.3, 41.4), Episode(73.2, 116.4)],
+            description="breathe, hold, breathe, hold"),
+    # justinas
+    Session("justinas-sleeping-1", "justinas_sleeping_20260919-184132.h5", "justinas"),
+    Session("justinas-sleeping-2", "justinas_sleeping_20260919-184458.h5", "justinas"),
+    Session("justinas-talking", "justinas_talking_20260919-185444.h5", "justinas",
+            description="talking - must never alarm"),
+    # The first hold starts at 4.6 s, inside the filter warmup, so its early features are a
+    # transient rather than chest motion. Scoring applies a warmup, but expect this hold to
+    # look worse than the others for reasons that are not the detector's fault.
+    Session("justinas-breath-hold", "justinas_breath-hold_20260919-185023.h5", "justinas",
+            holds=[Episode(4.6, 32.8), Episode(67.3, 114.0)],
+            description="breathe, hold, breathe, hold"),
+    # vishnu - negatives only, but a third subject to train against
+    Session("vishnu-sleeping", "vishnu_sleeping_20260919-183707.h5", "vishnu"),
 ]
+
+
+def subjects() -> list[str]:
+    return sorted({session.subject for session in SESSIONS})
 
 
 def session_by_name(name: str) -> Session:
@@ -99,6 +110,10 @@ class FeatureExtractor:
         self.zi = signal.sosfilt_zi(self.sos) * 0.0
 
         self.buffer_len = int(16 * self.fs)
+        # The band-pass rings for several seconds after it starts. Until the buffer is full
+        # those samples are a filter transient, not chest motion, and must not seed the
+        # baseline - doing so latches it to a near-zero value and makes every ratio explode.
+        self.warm = False
         self.filtered: list[float] = []
         self.raw: list[float] = []
 
@@ -177,9 +192,11 @@ class FeatureExtractor:
         rms_8 = self._window_rms(8.0)
         rms_16 = self._window_rms(16.0)
 
-        # The baseline learns what this person's normal breathing looks like. It only rises,
-        # never falls, so a long hold cannot quietly drag "normal" down to match itself.
-        if rms_8 > 0:
+        # The baseline learns what this person's normal breathing looks like. It only rises
+        # quickly, never falls quickly, so a long hold cannot quietly drag "normal" down to
+        # match itself.
+        self.warm = self.warm or len(self.filtered) >= self.buffer_len
+        if self.warm and rms_8 > 0:
             if self.baseline is None:
                 self.baseline = rms_8
             elif rms_8 > self.baseline:
@@ -188,7 +205,19 @@ class FeatureExtractor:
             else:
                 a = self.baseline_alpha * 0.1  # and down only very slowly
                 self.baseline = (1 - a) * self.baseline + a * rms_8
-        base = self.baseline if self.baseline else 1e-9
+
+        # Before a baseline exists we do not know what this person's normal looks like, so
+        # report a neutral ratio of 1.0 ("looks normal") rather than 0.0, which would read as
+        # a breath hold and alarm during every start-up.
+        if self.baseline is None or self.baseline <= 0:
+            base = float(rms_8) if rms_8 > 0 else 1.0
+            ratio_4 = ratio_8 = 1.0
+        else:
+            base = self.baseline
+            # Clamp: a ratio of 10 and a ratio of 10,000 mean the same thing (moving a lot),
+            # and the unclamped value wrecks any model that scales its inputs.
+            ratio_4 = min(rms_4 / base, 10.0)
+            ratio_8 = min(rms_8 / base, 10.0)
 
         n4 = int(4 * self.fs)
         disp_std = float(np.std(self.raw[-n4:])) if len(self.raw) >= n4 else 0.0
@@ -200,8 +229,8 @@ class FeatureExtractor:
                 rms_8,
                 rms_16,
                 base,
-                rms_4 / base,
-                rms_8 / base,
+                ratio_4,
+                ratio_8,
                 float(presence.intra.max()),
                 float(presence.inter.max()),
                 float(amplitude.mean()),

@@ -5,15 +5,16 @@ features, the same folds and the same metrics.
 
 Evaluation protocol
 -------------------
-There are only two labelled holds, so there is no honest way to do a large cross-validation.
-Instead there are two folds, and each hold is tested by a detector that never saw it:
+Leave-one-subject-out. For each subject with labelled holds, a detector is fitted on every
+other subject's recordings and tested on that subject's - so it is always judged on a body it
+has never seen. This is the only split that predicts what happens when the demo is run on
+someone new, and it is why the extra subjects mattered far more than extra minutes would have.
 
-    fold A: fit on hold 2 (+ first half of the negative sessions), test on hold 1
-    fold B: fit on hold 1 (+ second half of the negative sessions), test on hold 2
+Two subjects have holds (nishant, justinas), giving two folds and four held-out holds. The
+third subject contributes negatives to training only.
 
-A detector that needs no fitting scores the same either way, which is itself informative.
-Negatives are split by time so that a fitted detector cannot memorise the exact minute it
-will be tested on.
+A detector that needs no fitting scores the same on every fold, which is itself informative:
+it means the learned models are earning nothing for their complexity.
 
 What counts as good
 -------------------
@@ -66,23 +67,17 @@ def _clip(name: str, lo: float, hi: float) -> Clip:
 
 
 def folds() -> list[tuple[list[Clip], list[Clip]]]:
-    """[(train_clips, test_clips), ...] - one fold per labelled hold."""
-    hold_1, hold_2 = session_by_name("breath-hold").holds
-    # Split the hold session between the two holds, and the negative sessions in half.
-    split = (hold_1.end_s + hold_2.start_s) / 2
-    early = _clip("breath-hold", 0.0, split)
-    late = _clip("breath-hold", split, 1e9)
-    negatives = [("sleeping", 185.0), ("noisy", 185.0)]
+    """[(train_clips, test_clips), ...] - one fold per subject that has labelled holds."""
+    everyone = [_clip(session.name, 0.0, 1e9) for session in SESSIONS]
+    by_name = {session.name: session for session in SESSIONS}
 
-    fold_a = (
-        [late] + [_clip(n, 0.0, d / 2) for n, d in negatives],
-        [early] + [_clip(n, d / 2, 1e9) for n, d in negatives],
-    )
-    fold_b = (
-        [early] + [_clip(n, d / 2, 1e9) for n, d in negatives],
-        [late] + [_clip(n, 0.0, d / 2) for n, d in negatives],
-    )
-    return [fold_a, fold_b]
+    held_out = sorted({s.subject for s in SESSIONS if s.holds})
+    result = []
+    for subject in held_out:
+        train = [c for c in everyone if by_name[c.name.split("[")[0]].subject != subject]
+        test = [c for c in everyone if by_name[c.name.split("[")[0]].subject == subject]
+        result.append((train, test))
+    return result
 
 
 def score(detector: Detector, warmup_s: float = DEFAULT_WARMUP_S) -> EvaluationResult:
