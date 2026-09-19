@@ -71,12 +71,17 @@ def folds() -> list[tuple[list[Clip], list[Clip]]]:
     everyone = [_clip(session.name, 0.0, 1e9) for session in SESSIONS]
     by_name = {session.name: session for session in SESSIONS}
 
-    held_out = sorted({s.subject for s in SESSIONS if s.holds})
+    # Every subject gets a fold, including those with no holds. A subject who only ever
+    # breathes normally still tests the thing that matters most - whether the detector stays
+    # quiet on a body it has never seen. Leaving them permanently in the training set hides
+    # exactly that failure: vishnu's false alarms were invisible until this was fixed.
+    held_out = sorted({s.subject for s in SESSIONS})
     result = []
     for subject in held_out:
         train = [c for c in everyone if by_name[c.name.split("[")[0]].subject != subject]
         test = [c for c in everyone if by_name[c.name.split("[")[0]].subject == subject]
-        result.append((train, test))
+        if train and test:
+            result.append((train, test))
     return result
 
 
