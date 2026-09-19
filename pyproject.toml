@@ -1,0 +1,12 @@
+[project]
+name = "respiradar"
+version = "0.1.0"
+description = "Ambient nighttime breathing-rate monitoring with the Acconeer A121 (SparkFun XM125)"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "acconeer-exptool[algo]==7.18.2",
+    "numpy",
+    "scipy",
+    "fastapi",
+    "uvicorn[standard]",
+]
