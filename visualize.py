@@ -270,6 +270,7 @@ class Scope(QtWidgets.QMainWindow):
             ("chest", "CHEST AT"),
             ("amp", "CHEST MOTION"),
             ("presence", "PRESENCE"),
+            ("rate", "FRAME RATE"),
             ("state", "STATUS"),
         ]:
             box = QtWidgets.QVBoxLayout()
@@ -489,6 +490,22 @@ class Scope(QtWidgets.QMainWindow):
         # wall is worse than no readout, because people tune the hardware against it.
         #
         # What does separate them is the presence statistic below: wall 2.4, people 26-30.
+        # Measured frame rate against the rate the features were built for. FeatureExtractor
+        # sizes every window and time constant from config.frame_rate, while the detector
+        # derives fs from the actual timestamps. If the sensor cannot sustain the requested
+        # rate the two disagree and every time constant in the chain is wrong - which looks
+        # exactly like "the amplitude drops but nothing fires".
+        measured = 0.0
+        if i > 40:
+            span = t[i] - t[max(0, i - 200)]
+            if span > 0:
+                measured = (min(i, 200)) / span
+        expected = fs
+        bad = measured > 0 and abs(measured - expected) / expected > 0.15
+        self.readouts["rate"].setText(f"{measured:.1f} Hz" if measured else "--")
+        self.readouts["rate"].setStyleSheet(
+            f"font-size:30px; font-weight:600; color:{BAD if bad else GOOD};")
+
         self.readouts["presence"].setText("nobody" if not present else "person")
         self.readouts["presence"].setStyleSheet(
             f"font-size:30px; font-weight:600; color:{'#8b949e' if not present else GOOD};")
