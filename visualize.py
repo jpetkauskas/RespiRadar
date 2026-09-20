@@ -70,9 +70,9 @@ from respiradar.dataset import (
     session_by_name,
 )
 from respiradar.detectors.gated import (
+    PRESENCE_QUANTILE,
     PRESENCE_THRESHOLD,
     PRESENCE_WINDOW_S,
-    presence_activity,
 )
 from respiradar.live import EVALUATE_WINDOW_S
 from respiradar.sources import BASE_STEP_M, recorded_config, replay_frames
@@ -682,10 +682,12 @@ class Scope(QtWidgets.QMainWindow):
         # The gate's own function, not a copy of it. These were two separate expressions and
         # the copy here still computed a 60 s median after the gate moved to a 120 s high
         # quantile - a panel that explains the gate has to be the gate.
-        present = bool(
-            presence_activity(inter[max(0, i - window + 1) : i + 1], fs)[-1]
-            >= PRESENCE_THRESHOLD
-        )
+        # One quantile over the trailing window, not `presence_activity` over a slice:
+        # that helper loops internally, so calling it per draw re-derives the whole history
+        # every frame. Same number, O(window) instead of O(window^2/stride).
+        activity_now = float(np.quantile(inter[max(0, i - window + 1) : i + 1],
+                                         PRESENCE_QUANTILE))
+        present = activity_now >= PRESENCE_THRESHOLD
 
         # Panel 9: the raw slow-motion score, its 60 s trailing median (what the gate
         # actually tests) and the threshold. When the blue line dips under the red dashes the
@@ -694,7 +696,7 @@ class Scope(QtWidgets.QMainWindow):
         inter_win = inter[lo : i + 1]
         self.c_gate_raw.setData(t[lo : i + 1], inter_win)
         med_win = np.array([
-            presence_activity(inter[max(0, j - window + 1) : j + 1], fs)[-1]
+            np.quantile(inter[max(0, j - window + 1) : j + 1], PRESENCE_QUANTILE)
             for j in range(lo, i + 1, 5)
         ])
         self.c_gate_med.setData(t[lo : i + 1 : 5][: len(med_win)], med_win)
@@ -786,6 +788,17 @@ class Scope(QtWidgets.QMainWindow):
         else:
             self.readouts["state"].setText("breathing")
             colour = GOOD
+        # Print every change of the headline state, with the clock, so a live run leaves a
+        # record instead of a recollection. Twice now a reconstruction from the recording has
+        # disagreed with what was actually on screen, and there was no way to tell which was
+        # right: the recording holds the radar frames, not what the header did with them.
+        state_now = self.readouts["state"].text()
+        if state_now != getattr(self, "_last_state", None):
+            self._last_state = state_now
+            print(f"[{t[i]:7.1f}s] {state_now}"
+                  f"   alarm={bool(d['alarms'][i])} present={present}"
+                  f" activity={activity_now:.1f}/{PRESENCE_THRESHOLD}", flush=True)
+
         self.readouts["state"].setStyleSheet(
             f"font-size:30px; font-weight:600; color:{colour};")
         self.clock.setText(f"{t[i]:.1f} s")
