@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "pytest-xdist"]
 
 [build-system]
 requires = ["setuptools>=64"]
@@ -29,3 +29,9 @@ respiradar = ["static/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]  # so tests can import the top-level scripts (main.py, datalog.py)
+# Run in parallel by default: a handful of tests replay whole 3-minute recordings and
+# dominate the wall clock, so a bare `pytest` should spread them over the cores. Use
+# `-p no:xdist` (or `-n0`) to get a serial run back when debugging.
+# QT_QPA_PLATFORM=offscreen is set in tests/conftest.py, not here, so it applies to every
+# worker and to anyone importing the test modules directly.
+addopts = "-n auto --dist worksteal"

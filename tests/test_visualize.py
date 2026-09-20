@@ -5,15 +5,26 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np  # noqa: E402
+import pytest  # noqa: E402
 from PySide6 import QtWidgets  # noqa: E402
 
 import visualize  # noqa: E402
 from respiradar.dataset import session_by_name  # noqa: E402
 
 
-def test_scope_extracts_and_draws_a_session():
-    session = session_by_name("nishant-holds-2401")
-    data = visualize.extract(session)
+@pytest.fixture(scope="module")
+def scope_data():
+    """`visualize.extract` for one session.
+
+    It keeps per-frame intermediates (range profiles, the chest IQ, per-bin motion) that the
+    feature cache does not hold, so it has to replay the raw frames - but both tests want
+    the same replay, so it is done once.
+    """
+    return visualize.extract(session_by_name("nishant-holds-2401"))
+
+
+def test_scope_extracts_and_draws_a_session(scope_data):
+    data = scope_data
 
     assert len(data["t"]) == len(data["wave"]) == len(data["alarms"])
     assert data["profile"].shape[1] == len(data["distances"])
@@ -29,10 +40,9 @@ def test_scope_extracts_and_draws_a_session():
     app.processEvents()
 
 
-def test_the_breathing_band_isolates_a_plausible_rate():
+def test_the_breathing_band_isolates_a_plausible_rate(scope_data):
     """The wide 0.10 Hz band lets drift dominate; the scope uses 0.18-0.55 Hz instead."""
-    session = session_by_name("nishant-holds-2401")
-    data = visualize.extract(session)
+    data = scope_data
 
     breathing = data["wave"][data["t"] >= 30]
     spectrum = np.abs(np.fft.rfft(breathing - breathing.mean())) ** 2

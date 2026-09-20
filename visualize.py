@@ -264,6 +264,7 @@ class Scope(QtWidgets.QMainWindow):
             ("chest", "CHEST AT"),
             ("amp", "CHEST MOTION"),
             ("presence", "PRESENCE"),
+            ("quality", "SIGNAL"),
             ("state", "STATUS"),
         ]:
             box = QtWidgets.QVBoxLayout()
@@ -474,6 +475,28 @@ class Scope(QtWidgets.QMainWindow):
         if not present:
             bpm = None
         self.readouts["bpm"].setText("--" if bpm is None else f"{bpm:.1f}")
+        # Signal quality: does the chest trace actually repeat like breathing?
+        #
+        # This is the number to watch when positioning the sensor. The breathing rate and the
+        # wave panel are only meaningful when it is high. Recordings differ enormously -
+        # one subject's holds separate from their breathing at 0.18 of the amplitude, another
+        # at 0.69 - and that difference is placement, not code. Aim the sensor at the chest,
+        # roughly 0.5-0.9 m away, and move it until this reads "good".
+        seg = d["wave"][max(0, i - int(20 * fs)) : i + 1]
+        quality = 0.0
+        if len(seg) > 64:
+            x = seg - seg.mean()
+            if not np.allclose(x, 0):
+                ac = np.correlate(x, x, mode="full")[len(x) - 1 :] / (np.dot(x, x) + 1e-20)
+                lo, hi = int(fs * 60 / 30), min(int(fs * 60 / 8), len(ac) - 1)
+                if hi > lo:
+                    quality = float(np.max(ac[lo:hi]))
+        label = "good" if quality > 0.45 else ("weak" if quality > 0.25 else "poor")
+        self.readouts["quality"].setText(f"{label} {quality:.2f}")
+        self.readouts["quality"].setStyleSheet(
+            "font-size:30px; font-weight:600; color:"
+            + (GOOD if quality > 0.45 else WARN if quality > 0.25 else BAD) + ";")
+
         self.readouts["presence"].setText("nobody" if not present else "person")
         self.readouts["presence"].setStyleSheet(
             f"font-size:30px; font-weight:600; color:{'#8b949e' if not present else GOOD};")
