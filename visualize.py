@@ -51,6 +51,8 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
+import traceback
 
 import numpy as np
 import pyqtgraph as pg
@@ -149,13 +151,87 @@ def _run_detector(session, data, name):
     return np.zeros(len(data["t"]), dtype=bool)
 
 
+class LiveSource:
+    """A growing buffer of the same arrays `extract` produces, filled by a worker thread.
+
+    The scope does not care which it is given: replay hands it finished arrays, this hands it
+    arrays that get longer. Everything downstream indexes the same way.
+    """
+
+    def __init__(self, frames, config, detector_name="gated"):
+        import importlib
+
+        from respiradar.live import LiveDetector
+
+        mod = importlib.import_module(f"respiradar.detectors.{detector_name}")
+        build = getattr(mod, "build_best", mod.build)
+        self.live = LiveDetector(config, build())
+        self.frames = frames
+        self.config = config
+        self.fs = config.frame_rate
+        self.distances = config.distances_m
+        self.holds = []
+        self.error = None
+
+        self._t, self._profile, self._iq = [], [], []
+        self._bins, self._raw, self._feat, self._motion, self._alarm = [], [], [], [], []
+
+        nyq = self.fs / 2
+        self._sos = sig.butter(
+            2, [BAND[0] / nyq, BAND[1] / nyq], btype="bandpass", output="sos"
+        )
+        self._zi = sig.sosfilt_zi(self._sos) * 0.0
+        self._wave = []
+
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            for frame in self.frames():
+                row = self.live.process(frame)
+                mean_sweep = frame.iq.mean(axis=0)
+                ex = self.live.extractor
+                self._t.append(frame.t)
+                self._profile.append(np.abs(mean_sweep))
+                self._bins.append(ex._last_bin)
+                self._iq.append(mean_sweep[ex._last_bin])
+                self._raw.append(ex.raw[-1])
+                self._feat.append(row)
+                self._motion.append(
+                    ex.bin_slow.copy() if ex.bin_slow is not None
+                    else np.zeros(len(mean_sweep))
+                )
+                value, self._zi = sig.sosfilt(
+                    self._sos, [self._raw[-1] - self._raw[0]], zi=self._zi
+                )
+                self._wave.append(float(value[0]))
+                self._alarm.append(self.live.alarm)
+        except Exception as exc:
+            traceback.print_exc()
+            self.error = str(exc)
+
+    def __len__(self):
+        return len(self._t)
+
+    def __getitem__(self, key):
+        arrays = {
+            "t": self._t, "profile": self._profile, "chest_iq": self._iq,
+            "bin_index": self._bins, "raw_mm": self._raw, "features": self._feat,
+            "bin_motion": self._motion, "wave": self._wave, "alarms": self._alarm,
+        }
+        if key in arrays:
+            return np.asarray(arrays[key])
+        return {"distances": self.distances, "fs": self.fs, "holds": self.holds}[key]
+
+
 class Scope(QtWidgets.QMainWindow):
-    def __init__(self, data, title: str, speed: float = 1.0):
+    def __init__(self, data, title: str, speed: float = 1.0, live: bool = False):
         super().__init__()
         self.d = data
         self.i = 0
         self.speed = speed
         self.playing = True
+        self.live = live
 
         self.setWindowTitle(f"RespiRadar scope - {title}")
         self.resize(1680, 980)
@@ -299,7 +375,7 @@ class Scope(QtWidgets.QMainWindow):
         bar.addWidget(self.play_btn)
 
         self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.slider.setRange(0, len(self.d["t"]) - 1)
+        self.slider.setRange(0, max(0, len(self.d["t"]) - 1))
         self.slider.sliderMoved.connect(self.seek)
         bar.addWidget(self.slider, stretch=1)
 
@@ -317,7 +393,14 @@ class Scope(QtWidgets.QMainWindow):
         self.draw()
 
     def step(self):
-        if self.playing:
+        if self.live:
+            n = len(self.d["t"])
+            if n < 2:
+                return
+            self.i = n - 1  # live always shows now
+            self.slider.setRange(0, n - 1)
+            self.slider.setValue(self.i)
+        elif self.playing:
             self.i = (self.i + max(1, int(self.speed))) % len(self.d["t"])
             self.slider.setValue(self.i)
         self.draw()
@@ -390,10 +473,17 @@ class Scope(QtWidgets.QMainWindow):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--session", default="nishant-holds-2401")
+    parser.add_argument("--session", default="nishant-holds-2401",
+                        help="recorded session to replay")
     parser.add_argument("--detector", default="spectral")
     parser.add_argument("--speed", type=float, default=2.0, help="replay frames per tick")
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--port", help="live: serial port of the XM125")
+    parser.add_argument("--baudrate", type=int, default=230400)
+    parser.add_argument("--no-flow-control", action="store_true")
+    parser.add_argument("--simulate", action="store_true",
+                        help="live pipeline, synthetic sensor - no hardware needed")
+    parser.add_argument("--bpm", type=float, default=14.0)
     args = parser.parse_args()
 
     if args.list:
@@ -401,12 +491,42 @@ def main() -> int:
             print(f"  {s.name:<24} {s.subject:<9} {len(s.holds)} holds  {s.description}")
         return 0
 
-    session = session_by_name(args.session)
-    print(f"extracting {session.name} ...")
-    data = extract(session, args.detector)
-
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
-    scope = Scope(data, f"{session.name} ({session.subject})", args.speed)
+
+    if args.port or args.simulate:
+        from functools import partial
+
+        from respiradar.sources import (
+            RadarConfig, find_serial_port, radar_frames, simulated_frames,
+        )
+
+        config = RadarConfig(sweeps_per_frame=8)
+        port = None if args.simulate else (args.port or find_serial_port())
+        if port:
+            from main import fit_config
+
+            config = fit_config(config, args.baudrate)
+            frames = partial(radar_frames, port, config=config, baudrate=args.baudrate,
+                             flow_control=not args.no_flow_control)
+            title = f"LIVE - {port}"
+            print(f"connecting to {port} at {args.baudrate} baud ...")
+        else:
+            if not args.simulate:
+                print("no radar found - running the simulator instead")
+            frames = partial(simulated_frames, config, breaths_per_min=args.bpm,
+                             realtime=True)
+            title = f"LIVE - simulator @ {args.bpm:.0f} bpm"
+        # "gated" is the live detector: it consumes the streaming feature row directly and
+        # will not alarm at an empty room. spectral scores as well but resolves its features
+        # per recorded session, so it cannot run on a sensor.
+        data = LiveSource(frames, config, "gated")
+        scope = Scope(data, title, live=True)
+    else:
+        session = session_by_name(args.session)
+        print(f"extracting {session.name} ...")
+        data = extract(session, args.detector)
+        scope = Scope(data, f"{session.name} ({session.subject})", args.speed)
+
     scope.show()
     return app.exec()
 

@@ -1,42 +1,39 @@
-"""Supervised apnea detector: a random forest on the shared features, behind a causal alarm gate.
+"""Supervised apnea detector: a gradient-boosted classifier behind a causal duration gate.
 
-Scores 2/4 holds with ZERO false alarms over 16.8 minutes of negatives, leave-one-subject-out.
-The fixed-threshold baseline gets 3/4 with 10 false alarms on the same protocol, so what the
-model buys is the generalisation, not the sensitivity. The honest reading of that trade and of
-the two misses is at the bottom of this file; read it before trusting the number.
+Leave-one-subject-out over 13 holds and 23 minutes of negatives: 7/13 holds, ZERO false
+alarms, worst-case latency 27.7 s, median 23.9 s. That is well behind the hand-built
+change-point and spectral entries, and the reason is in the features rather than in the
+model - see the assessment at the bottom of this file before reading the number as a verdict
+on supervised learning.
 
 Causality
 ---------
-The 12 supplied features are already causal, so the only ways to leak the future are window
+The shared features are already causal, so the only ways to leak the future are window
 statistics that reach forwards and normalisation fitted on the clip being scored. Neither
-happens here: every rolling statistic (`_sliding`, `_time_since_above`, `_causal_quantile`)
-ends its window at the current index, and the scaler is fitted in `fit()` on training clips
-alone. `predict(clip.X[:k])` equals `predict(clip.X)[:k]` exactly, which is the property that
-matters for running live on the sensor.
+happens here: every rolling statistic (`_sliding`, `_time_since_above`, `_down_cusum`) ends
+its window at the current index, and the scaler is fitted in `fit()` on training clips alone.
+`predict(clip.X[:k])` equals `predict(clip.X)[:k]` exactly, which is the property that matters
+for running live on a sensor, and it is checked rather than assumed.
 
 Why the raw feature row is not enough
-------------------------------------
-A single 50 ms frame cannot tell a breath hold from the gap between two breaths, and a fixed
-threshold on `ratio_4s` cannot tell one person's hold from another person's shallow sleeping.
-Both problems are about context, so each row is expanded with backwards-looking context:
-
-- how long the chest energy has been quiet (`_time_since_above`, quiet fractions),
-- how quiet it is *relative to how quiet this person has been lately* (`_causal_quantile`),
-- whether anything periodic is still happening (autocorrelation over several horizons).
-
-The third is the one that travels between bodies. Shallow breathing is still breathing and
-keeps a clear autocorrelation peak at the breathing period however small its amplitude gets;
-a hold has nothing to be periodic about.
+-------------------------------------
+A single 50 ms frame cannot tell a hold from the gap between two breaths, and a fixed level
+cannot tell one person's hold from another person's shallow sleeping. Both are context
+problems, so each row is expanded with backwards-looking context: how long it has been quiet,
+how quiet it is relative to how quiet this person has recently been, whether anything
+periodic is still happening, and one-sided CUSUM charts of the drop itself. `augment` says
+which column is there for which reason.
 
 The alarm gate
 --------------
-The per-frame probability is smoothed over the last second, has to stay above `on_threshold`
-for `min_duration_s` continuously before the alarm arms, and then latches until the
-probability drops below `off_threshold`. The long arming duration is doing most of the work:
-the negative sessions contain quiet stretches of 8-26 s, and requiring ten unbroken seconds of
-high probability is what keeps them quiet. Hysteresis is deliberately NOT load-bearing here -
-the score is identical for any `off_threshold` from 0.10 to 0.38 - so the result does not
-depend on an alarm bridging a gap between two nearby events.
+The per-frame probability is smoothed over the last second, must stay above `on_threshold`
+for `min_duration_s` continuously to arm, and then latches until it falls below
+`off_threshold`. The duration requirement is the load-bearing part: negative recordings
+contain quiet stretches of 8-26 s, and demanding eight unbroken seconds of high probability
+is what keeps them silent. Hysteresis is deliberately NOT load-bearing - the score is
+identical for every `off_threshold` from 0.10 to 0.60 - so nothing here depends on one alarm
+bridging the gap between two nearby events, which is how an earlier version of this file
+bought its zeroes.
 """
 
 from __future__ import annotations
@@ -228,10 +225,10 @@ class SupervisedApneaDetector:
 
     def __init__(
         self,
-        on_threshold: float = 0.70,
+        on_threshold: float = 0.92,
         off_threshold: float = 0.20,
         smooth_s: float = 1.0,
-        min_duration_s: float = 10.0,
+        min_duration_s: float = 8.0,
         onset_grace_s: float = 6.0,
         recovery_grace_s: float = 6.0,
         model: str = "hgb",
@@ -267,7 +264,7 @@ class SupervisedApneaDetector:
                 random_state=0,
                 # Off deliberately: sklearn turns early stopping on above 10k rows, which
                 # carves out a random validation split and makes the fitted model depend on
-                # the seed. With four labelled events in the whole dataset, a scoring
+                # the seed. With thirteen labelled events in the whole dataset, a scoring
                 # difference that comes from a seed is noise being mistaken for tuning.
                 early_stopping=False,
             )
@@ -380,32 +377,43 @@ def build():
 # ---------------------------------------------------------------------------------------
 # Honest assessment
 # ---------------------------------------------------------------------------------------
-# Cross-subject (bakeoff.folds, leave-one-subject-out): 2/4 holds, worst latency 29.8 s,
-# median 24.1 s, 0 false alarms in 16.8 min of negatives. Fit on everything and run whole
-# sessions instead and it is 4/4 with 0 false alarms - which is exactly the optimistic number
-# the fold protocol exists to disbelieve.
+# Cross-subject (bakeoff.folds, leave-one-subject-out): 7/13 holds, 0 false alarms in 23.0
+# minutes, worst latency 27.7 s, median 23.9 s. Fit on everything and run whole sessions and
+# it is 13/13 with 0 false alarms - which is exactly the optimistic number the fold protocol
+# exists to disbelieve.
 #
-# What it misses, and why. Both missed holds are each subject's FIRST hold: nishant's at
-# 14.3 s and justinas' at 4.6 s. Both start inside or immediately after the 25 s scoring
-# warm-up, so the band-pass is still ringing, the supplied baseline has barely formed, and the
-# rolling quantile references have almost no history to be quiet relative to. The model's peak
-# probability inside those two holds is 0.14 and 0.24, against 0.85 for the quietest stretch
-# of justinas' ordinary sleeping - no threshold recovers them, and nothing in the tuning got
-# them above the noise. A hold that starts two minutes into a recording is a different and
-# much easier problem than one that starts before the filters have settled.
+# Why it loses to the hand-built entries. It is not the classifier and it is not the alarm
+# gate; it is that the shared feature row does not describe most of these holds. Taking the
+# mean of rms_4s inside each labelled hold over its own session's mean outside, across all 13
+# holds, gives 0.46 to 1.47 - four holds have MORE band-limited chest energy while the
+# subject is holding their breath than while they are breathing. `ratio_4s_q`, the trailing
+# 25th-percentile self-reference, averages above 1.0 inside 11 of the 13 holds. A detector
+# that reads these columns as levels therefore cannot see most of the events at any
+# threshold, and the per-hold probabilities show exactly that: within one session the model
+# is at 0.99 for one hold and 0.01 for the two before it. The entries that score 12/13 and
+# 13/13 recompute their own statistic from the range data instead of reading these columns.
 #
-# Would it survive a live demo? For a hold taken after a minute or two of normal breathing,
-# probably: the 0-false-alarm result held across five random seeds, across random-forest
-# depths from 6 to unlimited, and across every off_threshold tried, and the negatives it
-# stays silent through include a subject it never trained on. For a hold taken in the first
-# half-minute after the sensor starts, no - it will miss it, and that is the failure mode to
-# design the demo around (let the subject breathe normally for a minute first).
+# The binding false alarm is vishnu. Sustained over 12 s, the highest apnea probability
+# anywhere in the negative recordings is 0.86, and it is in vishnu-sleeping - the one subject
+# with no holds at all, so the model never sees a body like that labelled either way. Every
+# other negative session sits below 0.3 at that duration. The operating point is set by that
+# one recording; without it the same model would run at a much lower threshold and catch
+# more.
 #
-# The honest caveat is the sample size. Four holds from two subjects is not a test set; it is
-# an anecdote with error bars wider than the effect. The 29.8 s worst-case latency in
-# particular rests on one hold, and the labelled hold boundaries themselves are marker presses
-# - justinas' first hold is followed by 13 s of labelled-negative quiet that looks exactly
-# like a hold, which is either late marker timing or the subject still recovering. What the
-# comparison against the threshold baseline does support, because it is a difference of ten
-# false alarms and not of one, is the original question: a learned model on subject-relative
-# features does transfer across bodies where a hand-tuned threshold does not.
+# Would it survive a live demo? For a hold on a body resembling one it trained on, and taken
+# after a minute of normal breathing, yes - and it will not cry wolf, which is the property
+# it was tuned for. But it misses about half the holds, so it should not be the thing on
+# stage. If this approach is wanted in the demo, the useful shape is as a veto or a second
+# opinion beside a detector that computes its own drop statistic, not as the primary alarm.
+#
+# What is worth keeping from it regardless of which detector ships: dimensionless
+# subject-relative features rather than absolute amplitudes (a model given raw rms learns
+# which recording it is looking at), and duration rather than depth as the thing that buys
+# off false alarms. Both survived every revision of the features in this project.
+#
+# Caveats on the numbers themselves. Thirteen holds from two subjects is three times what
+# this file was first tuned on and still not a test set; frames inside a hold are correlated,
+# so the effective n is 13. The 0-false-alarm result holds for `on_threshold` from 0.90 to
+# 0.96 at `min_duration_s` 8 and for every `off_threshold` tried, and early stopping is
+# switched off so the fit does not move with the seed - but 0.88 costs a false alarm, so the
+# margin on the low side is one grid step, not a comfortable band.

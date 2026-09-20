@@ -8,14 +8,18 @@ expected delay, which is this bake-off's objective function written out in full.
 
 Three things had to be got right before the CUSUM itself mattered.
 
-1. What the statistic is measured against. The obvious choice, `ratio_4s`, divides by a
-   baseline that rises quickly and falls only very slowly, so one burst of movement leaves
-   "normal" inflated for minutes and ordinary breathing afterwards reads as a hold. Here the
-   reference is the lower of that baseline and a trailing quantile of log `rms_8s` over the
-   preceding minute, excluding the last few seconds so the hold cannot pull its own
-   reference down with it. Every channel is a log ratio against that reference, which makes
-   the numbers dimensionless and comparable between bodies - the thing fixed thresholds on
-   raw features conspicuously fail to do across subjects.
+1. What the statistic is measured against. There are two references and they answer
+   different questions, so the charts use both. `ref_ratchet` rises quickly and falls only
+   very slowly: a liability on negatives, because one burst of movement leaves "normal"
+   inflated for minutes and ordinary breathing afterwards reads as a hold, but exactly what
+   a fast channel wants, since a reference that refuses to follow a hold downwards keeps
+   the step visible for the hold's whole length. `ref_q25` is a trailing 25th percentile
+   with no such memory; its level sits in a narrow band across subjects where the ratchet's
+   wanders from 0.14 to 0.79, which is why fixed thresholds on the ratchet do not transfer.
+   Measured on four holds the ratchet dominated. Measured on thirteen, neither wins alone.
+   Every channel is a log ratio against one of them, or against a trailing median of this
+   module's own floored by the ratchet, which makes the numbers dimensionless and
+   comparable between bodies.
 
 2. A motion gate. Talking and rolling over produce their own energy excursions, and the
    `intra` presence score and `disp_std_4s` both rise while they happen. Those frames do not
@@ -31,10 +35,18 @@ Three things had to be got right before the CUSUM itself mattered.
 The detector is a small bank of CUSUM charts run in parallel, which is standard practice
 when the post-change distribution is not known exactly: one chart is tuned for a deep, fast
 collapse and another for a shallower, longer one, and the union alarms when either does.
-Because every chart in the bank is individually free of false alarms on the training folds,
-so is their union.
+Because every chart in the bank is individually free of false alarms, so is their union -
+every alarm frame belongs to some chart's episode, and that episode overlaps a hold.
 
-Everything is strictly causal: the alarm at frame i reads only `clip.X[:i + 1]`.
+What this module deliberately does not do is notice that nobody is there. An empty room
+produces no chest motion, which is indistinguishable from apnea by construction, and no
+threshold inside a chart can tell them apart. That belongs to a presence gate, and
+`gated.py` supplies one; assume this detector's output is wrapped in it.
+
+Everything is strictly causal: the alarm at frame i reads only `clip.X[:i + 1]`. There is a
+test for it - predicting on every prefix of a session reproduces the full-session output
+exactly - and it has already caught one bug, a frame-rate estimate whose last decimal place
+moved a window boundary depending on how much future happened to exist.
 """
 
 from __future__ import annotations
@@ -190,34 +202,44 @@ class Chart:
         return alarms
 
 
-# Two charts, found by a random search over the leave-one-subject-out folds, keeping only
-# configurations with no false alarms at all and then taking the pair whose union caught the
-# most holds soonest. They divide the work: the first is the patient one that carries the
-# long holds, the second is a faster, `ratio`-heavy chart that shortens the median.
+# Four charts, chosen by a two-stage random search (65 000 configurations) over the
+# leave-one-subject-out folds. Only configurations with no false alarm on any recording were
+# kept, then a greedy union picked the set that caught the most holds soonest. The union of
+# alarm-free charts is itself alarm-free, which is why a bank costs nothing here.
+#
+# Both references earn a place, which is the answer to a question worth recording. Measured
+# on four holds the ratcheting reference dominated; measured on thirteen, neither wins
+# alone - the best single chart of any kind uses both, and so does this bank.
 DEFAULT_CHARTS: list[dict] = [
     dict(
-        note="slow: presence slow-motion score, with the quantile reference as support",
-        weights={"inter": 2.0, "energy": 0.5, "ratio_q8": 0.5},
-        deadband=0.4, cap=0.5, threshold=60.0, decay=0.999, refractory_s=0.0,
-        window_s=60.0, gap_s=4.0, history_s=16.0,
-        gate=dict(intra_k=2.5, intra_abs=2.0, disp_k=2.0, disp_floor_k=0.3),
+        note="patient: presence, the quantile reference and my own median; carries most holds",
+        weights={"inter": 2.0, "energy": 0.5, "ratio_q": 0.5},
+        deadband=0.1, cap=1.2, threshold=200.0, decay=0.999, refractory_s=8.0,
+        window_s=75.0, gap_s=5.0, history_s=16.0,
+        gate=dict(intra_k=3.0, intra_abs=2.5, disp_k=1.5, disp_floor_k=0.1),
     ),
     dict(
-        note="fast: presence alone, short threshold, wide-open gate",
+        note="presence alone, leaky, low threshold: picks up the holds the first chart misses",
         weights={"inter": 0.5},
-        deadband=0.7, cap=0.8, threshold=10.0, decay=0.999, refractory_s=0.0,
+        deadband=0.4, cap=0.8, threshold=30.0, decay=0.995, refractory_s=0.0,
         window_s=90.0, gap_s=6.0, history_s=12.0,
-        gate=dict(intra_k=1.5, intra_abs=2.5, disp_k=2.0, disp_floor_k=0.0),
+        gate=dict(intra_k=2.0, intra_abs=10.0, disp_k=3.0, disp_floor_k=0.1),
     ),
     dict(
-        note="patient: 8 s energy against the ratcheting reference, long integration",
-        weights={"ratio_8": 0.5, "inter": 0.5},
-        deadband=0.1, cap=0.8, threshold=160.0, decay=0.999, refractory_s=0.0,
+        note="energy only, ratcheting reference, no deadband: the fast chart",
+        weights={"ratio": 0.5, "energy": 0.5},
+        deadband=0.0, cap=0.4, threshold=120.0, decay=0.999, refractory_s=0.0,
+        window_s=90.0, gap_s=6.0, history_s=12.0,
+        gate=dict(intra_k=3.0, intra_abs=2.5, disp_k=2.0, disp_floor_k=0.1),
+    ),
+    dict(
+        note="8 s energy against the quantile reference, plus presence: shortens the median",
+        weights={"ratio_q8": 0.5, "inter": 0.5},
+        deadband=0.5, cap=1.5, threshold=30.0, decay=1.0, refractory_s=8.0,
         window_s=120.0, gap_s=8.0, history_s=12.0,
-        gate=dict(intra_k=3.0, intra_abs=10.0, disp_k=2.0, disp_floor_k=0.1),
+        gate=dict(intra_k=1.5, intra_abs=3.0, disp_k=1.5, disp_floor_k=0.0),
     ),
 ]
-
 
 
 class ChangePointDetector:
@@ -281,36 +303,11 @@ class ChangePointDetector:
         return alarms
 
 
-# The same search, but required to be free of false alarms on *all eight* recordings rather
-# than only on the two subjects leave-one-subject-out ever tests. vishnu-sleeping contains a
-# genuine ~8 s stretch of complete stillness that no scored fold contains, and clearing it
-# costs a hold: 3/4 detected, 21.3 s worst case, zero false alarms anywhere. The bake-off
-# ranks misses above latency, so `build()` returns the four-hold bank, but this is the
-# variant to reach for if a false alarm in the demo would be worse than a missed hold.
-CONSERVATIVE_CHARTS: list[dict] = [
-    dict(
-        note="slow: presence plus both references, no leak, long refractory",
-        weights={"inter": 1.0, "energy": 0.5, "ratio_8": 0.5},
-        deadband=0.1, cap=0.3, threshold=120.0, decay=1.0, refractory_s=8.0,
-        window_s=120.0, gap_s=8.0, history_s=12.0,
-        gate=dict(intra_k=2.0, intra_abs=2.5, disp_k=3.0, disp_floor_k=0.0),
-    ),
-    dict(
-        note="presence alone, leaky",
-        weights={"inter": 0.5},
-        deadband=0.4, cap=0.8, threshold=30.0, decay=0.995, refractory_s=0.0,
-        window_s=90.0, gap_s=6.0, history_s=12.0,
-        gate=dict(intra_k=2.0, intra_abs=10.0, disp_k=3.0, disp_floor_k=0.1),
-    ),
-    dict(
-        note="energy only, ratcheting reference, very high threshold",
-        weights={"ratio": 1.0, "ratio_8": 0.5, "energy": 0.5},
-        deadband=0.4, cap=0.8, threshold=240.0, decay=0.999, refractory_s=8.0,
-        window_s=30.0, gap_s=2.0, history_s=16.0,
-        gate=dict(intra_k=1.5, intra_abs=2.5, disp_k=2.0, disp_floor_k=0.1),
-    ),
-]
-
+# The two charts with the most margin: the highest thresholds and the strictest gates. The
+# full bank is already silent on every recording, so this is no longer a false-alarm hedge;
+# it is for callers who want extra headroom on an unseen body and can afford the holds it
+# gives up. `gated.py` wraps this one.
+CONSERVATIVE_CHARTS: list[dict] = [DEFAULT_CHARTS[0], DEFAULT_CHARTS[2]]
 
 
 def build():

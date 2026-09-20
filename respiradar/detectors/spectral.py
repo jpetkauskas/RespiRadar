@@ -419,16 +419,20 @@ class SpectralApneaDetector:
 
     def __init__(
         self,
-        quiet_mm: float = 0.35,
-        quiet_s: float = 5.0,
-        deep_ratio: float = 0.12,
-        deep_s: float = 4.0,
+        fast_mm: float = 0.35,
+        fast_s: float = 4.0,
+        quiet_mm: float = 0.40,
+        quiet_s: float = 6.0,
+        deep_ratio: float = 0.08,
+        deep_s: float = 6.0,
         rel_ratio: float = 0.30,
-        rel_s: float = 11.0,
+        rel_s: float = 12.0,
         release: float = 2.0,
         intra_gate: float = 4.0,
         occupancy_gate: float = OCCUPANCY_THRESHOLD,
     ) -> None:
+        self.fast_mm = fast_mm
+        self.fast_s = fast_s
         self.quiet_mm = quiet_mm
         self.quiet_s = quiet_s
         self.deep_ratio = deep_ratio
@@ -450,20 +454,31 @@ class SpectralApneaDetector:
         fs = 1 / max(float(np.median(np.diff(clip.t))), 1e-6)
 
         a = X[:, F["A"]]
+        a_fast = X[:, F["A_fast"]]
         ratio = X[:, F["ratio_p"]]
-        # A == 0 marks a warmup row; base_p == 0 means the percentile has no history yet.
-        ready = (a > 0) & (X[:, F["base_p"]] > 0)
-        ready &= X[:, F["intra"]] < self.intra_gate
-        ready &= X[:, F["occupied"]] > self.occupancy_gate
+
+        # A == 0 marks a warmup row. The absolute branches are ready as soon as there is a
+        # spectrum; only the ratio branches have to wait for the trailing percentile to
+        # have any history, and gating them together would hand the wait to branches that
+        # never needed it - which is how a hold beginning near the start of a recording
+        # gets missed for no good reason.
+        gates = (X[:, F["intra"]] < self.intra_gate) & (
+            X[:, F["occupied"]] > self.occupancy_gate
+        )
+        ready = (a > 0) & gates
+        ready_rel = ready & (X[:, F["base_p"]] > 0)
 
         trigger = ready & (
-            _sustained(ready & (a < self.quiet_mm), int(self.quiet_s * fs))
-            | _sustained(ready & (ratio < self.deep_ratio), int(self.deep_s * fs))
-            | _sustained(ready & (ratio < self.rel_ratio), int(self.rel_s * fs))
+            _sustained(ready & (a_fast < self.fast_mm), int(self.fast_s * fs))
+            | _sustained(ready & (a < self.quiet_mm), int(self.quiet_s * fs))
+            | _sustained(ready_rel & (ratio < self.deep_ratio), int(self.deep_s * fs))
+            | _sustained(ready_rel & (ratio < self.rel_ratio), int(self.rel_s * fs))
         )
 
-        recovered = (a > self.release * self.quiet_mm) & (
-            ratio > self.release * self.rel_ratio
+        recovered = (
+            (a > self.release * self.quiet_mm)
+            & (a_fast > self.release * self.fast_mm)
+            & (ratio > self.release * self.rel_ratio)
         )
         alarms = np.zeros(len(clip.t), dtype=bool)
         on = False

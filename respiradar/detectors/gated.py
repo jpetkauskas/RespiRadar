@@ -68,24 +68,21 @@ def build():
 
 
 def build_best():
-    """The full demo candidate: the best-scoring detector, plus the empty-room gate.
+    """The detector the live app runs: change-point charts plus the empty-room gate.
+
+    Not simply the top of the bake-off table. `spectral` ties on score and has a slightly
+    better median latency, but it resolves its features by looking them up per recorded
+    session, so it cannot run on a live sensor at all without being rewritten. The
+    change-point charts consume the streaming feature row directly, which is what a live
+    detector has to do.
 
     `ensemble/fusion` is the only entry reaching 4/4 holds at zero false alarms, but like
     every other entry it was measured only on recordings containing a person, so ungated it
     alarms on an empty room.
 
-    The spectral member is given zero weight here, which the ensemble's own ablation showed
-    scores identically at this operating point - the whole gain is a 2 s persistence filter
-    on the change-point charts, and the second member is inert. Dropping it removes a
-    dependency on per-session cached features, which in turn is what lets this detector be
-    tested against a simulated empty room at all. Fewer moving parts for the same score.
+    The full four-chart bank: 12/13 holds, zero false alarms across 23 minutes of negatives,
+    median latency 18.0 s, leave-one-subject-out. The single miss is the 4.6 s hold that
+    begins inside the filter warmup. Ungated it alarms on 44-54% of an empty room, which is
+    what the gate is for.
     """
-    inner = ensemble.FusionEnsemble(
-        {"changepoint": changepoint.build()},
-        weights={"changepoint": 1.0},
-        threshold=1.0,
-        dwell_s=2.0,
-        release=0.5,
-        name="fusion(changepoint-only)",
-    )
-    return PresenceGatedDetector(inner=inner, name="gated/best")
+    return PresenceGatedDetector(inner=changepoint.build(), name="gated/best")

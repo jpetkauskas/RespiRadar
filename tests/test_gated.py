@@ -89,3 +89,51 @@ def build_best_detector():
     from respiradar.detectors.gated import build_best
 
     return build_best()
+
+
+def test_the_live_detector_finds_holds_in_a_recording():
+    """The live path: frames in one at a time, same answer as the batch evaluation.
+
+    The detectors are written against a whole clip at once, which is right for scoring and
+    wrong for a sensor. This runs the streaming adapter over a recording and checks it still
+    catches the holds and stays silent on a subject with none.
+    """
+    import numpy as np
+
+    from respiradar.dataset import session_by_name
+    from respiradar.detectors.gated import build_best
+    from respiradar.live import LiveDetector
+    from respiradar.sources import recorded_config, replay_frames
+
+    session = session_by_name("nishant-holds-2401")
+    live = LiveDetector(recorded_config(session.path), build_best())
+    times = []
+    for frame in replay_frames(session.path):
+        live.process(frame)
+        times.append(frame.t)
+
+    t = np.asarray(times)
+    alarms = np.asarray(live.alarms)
+    caught = [h for h in session.holds
+              if alarms[(t >= h.start_s) & (t < h.end_s)].any()]
+
+    assert len(caught) == len(session.holds)
+
+
+def test_the_live_detector_stays_silent_on_a_subject_with_no_holds():
+    import numpy as np
+
+    from respiradar.dataset import session_by_name
+    from respiradar.detectors.gated import build_best
+    from respiradar.live import LiveDetector
+    from respiradar.sources import recorded_config, replay_frames
+
+    session = session_by_name("vishnu-sleeping")
+    live = LiveDetector(recorded_config(session.path), build_best())
+    times = []
+    for frame in replay_frames(session.path):
+        live.process(frame)
+        times.append(frame.t)
+
+    settled = np.asarray(times) >= 25
+    assert not np.asarray(live.alarms)[settled].any()
