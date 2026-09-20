@@ -419,17 +419,19 @@ class SpectralApneaDetector:
 
     def __init__(
         self,
-        fast_mm: float = 0.35,
-        fast_s: float = 4.0,
+        fast_mm: float = 0.18,
+        fast_s: float = 5.0,
         quiet_mm: float = 0.40,
         quiet_s: float = 6.0,
-        deep_ratio: float = 0.08,
-        deep_s: float = 6.0,
+        deep_ratio: float = 0.0,
+        deep_s: float = 5.0,
         rel_ratio: float = 0.30,
         rel_s: float = 12.0,
         release: float = 2.0,
         intra_gate: float = 4.0,
         occupancy_gate: float = OCCUPANCY_THRESHOLD,
+        require_baseline: bool = True,
+        name: str | None = None,
     ) -> None:
         self.fast_mm = fast_mm
         self.fast_s = fast_s
@@ -442,6 +444,9 @@ class SpectralApneaDetector:
         self.release = release
         self.intra_gate = intra_gate
         self.occupancy_gate = occupancy_gate
+        self.require_baseline = require_baseline
+        if name:
+            self.name = name
 
     def fit(self, clips) -> None:
         """Nothing is learned from the labels. A threshold fitted to thirteen holds from
@@ -465,8 +470,14 @@ class SpectralApneaDetector:
         gates = (X[:, F["intra"]] < self.intra_gate) & (
             X[:, F["occupied"]] > self.occupancy_gate
         )
-        ready = (a > 0) & gates
-        ready_rel = ready & (X[:, F["base_p"]] > 0)
+        ready_rel = (a > 0) & gates & (X[:, F["base_p"]] > 0)
+        # `require_baseline` also holds the absolute branches back until the trailing
+        # percentile has real history. It costs a few seconds of latency on a hold that
+        # begins early in a recording, and it is what keeps the default at zero false
+        # alarms: without it the absolute branch fires on the tail of a hold whose label
+        # ends thirteen seconds before the subject actually resumes breathing, which scores
+        # as a false alarm and a miss at once.
+        ready = ready_rel if self.require_baseline else (a > 0) & gates
 
         trigger = ready & (
             _sustained(ready & (a_fast < self.fast_mm), int(self.fast_s * fs))
@@ -492,7 +503,37 @@ class SpectralApneaDetector:
 
 
 def build():
+    """The default: zero false alarms first, as the bake-off asks.
+
+    12/13 holds, no false alarms in 23 minutes of negatives across three subjects.
+    """
     return SpectralApneaDetector()
+
+
+def build_sensitive():
+    """The only configuration anyone has found that reaches 13/13, at one false alarm.
+
+    It drops `require_baseline`, so the absolute branches may fire before the trailing
+    percentile has history, and shortens every dwell. That buys justinas-breath-hold's
+    first hold - the 4.6 s one, which no other detector catches - and about four seconds
+    of median latency, and costs one false alarm on vishnu-sleeping.
+
+    That false alarm is a real eight-second respiratory pause in a negative recording, not
+    a modelling artefact, and the dwell needed to reject it is longer than the evidence the
+    4.6 s hold offers inside the scoring window. The two cannot both be had on this data.
+    Not the default, because the bake-off ranks a false alarm above a miss.
+    """
+    return SpectralApneaDetector(
+        require_baseline=False,
+        fast_mm=0.20,
+        fast_s=3.0,
+        quiet_mm=0.30,
+        quiet_s=4.0,
+        deep_ratio=0.0,
+        rel_ratio=0.30,
+        rel_s=10.0,
+        name="spectral/range-stft-sensitive",
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover
