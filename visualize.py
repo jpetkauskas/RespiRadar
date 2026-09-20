@@ -493,15 +493,23 @@ def main() -> int:
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 
-    if args.port or args.simulate:
+    # Go live when asked to, and also when a sensor is simply plugged in and no particular
+    # recording was requested - which is what someone running `visualize.py` at a demo means.
+    from respiradar.sources import find_serial_port
+
+    detected = None if args.simulate else find_serial_port()
+    session_requested = "--session" in sys.argv
+    go_live = bool(args.port or args.simulate or (detected and not session_requested))
+
+    if go_live:
         from functools import partial
 
         from respiradar.sources import (
-            RadarConfig, find_serial_port, radar_frames, simulated_frames,
+            RadarConfig, radar_frames, simulated_frames,
         )
 
         config = RadarConfig(sweeps_per_frame=8)
-        port = None if args.simulate else (args.port or find_serial_port())
+        port = None if args.simulate else (args.port or detected)
         if port:
             from main import fit_config
 
@@ -523,6 +531,9 @@ def main() -> int:
         scope = Scope(data, title, live=True)
     else:
         session = session_by_name(args.session)
+        if not session_requested:
+            print("no radar detected - replaying a recording instead "
+                  "(pass --simulate for the live pipeline without hardware)")
         print(f"extracting {session.name} ...")
         data = extract(session, args.detector)
         scope = Scope(data, f"{session.name} ({session.subject})", args.speed)
