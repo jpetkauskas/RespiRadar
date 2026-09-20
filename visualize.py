@@ -264,7 +264,6 @@ class Scope(QtWidgets.QMainWindow):
             ("chest", "CHEST AT"),
             ("amp", "CHEST MOTION"),
             ("presence", "PRESENCE"),
-            ("quality", "SIGNAL"),
             ("state", "STATUS"),
         ]:
             box = QtWidgets.QVBoxLayout()
@@ -475,28 +474,15 @@ class Scope(QtWidgets.QMainWindow):
         if not present:
             bpm = None
         self.readouts["bpm"].setText("--" if bpm is None else f"{bpm:.1f}")
-        # Signal quality: does the chest trace actually repeat like breathing?
+        # A SIGNAL quality readout used to live here, scoring the autocorrelation of the
+        # chest trace. It was removed because it did not work: measured across every
+        # recording its median ran 0.24-0.44, and the WALL recording - nobody in the room -
+        # scored 0.28, indistinguishable from a breathing person. It was measuring correlated
+        # noise, and its "good" threshold of 0.45 was above the median of every session ever
+        # recorded, so it could never be reached. A readout that cannot tell a person from a
+        # wall is worse than no readout, because people tune the hardware against it.
         #
-        # This is the number to watch when positioning the sensor. The breathing rate and the
-        # wave panel are only meaningful when it is high. Recordings differ enormously -
-        # one subject's holds separate from their breathing at 0.18 of the amplitude, another
-        # at 0.69 - and that difference is placement, not code. Aim the sensor at the chest,
-        # roughly 0.5-0.9 m away, and move it until this reads "good".
-        seg = d["wave"][max(0, i - int(20 * fs)) : i + 1]
-        quality = 0.0
-        if len(seg) > 64:
-            x = seg - seg.mean()
-            if not np.allclose(x, 0):
-                ac = np.correlate(x, x, mode="full")[len(x) - 1 :] / (np.dot(x, x) + 1e-20)
-                lo, hi = int(fs * 60 / 30), min(int(fs * 60 / 8), len(ac) - 1)
-                if hi > lo:
-                    quality = float(np.max(ac[lo:hi]))
-        label = "good" if quality > 0.45 else ("weak" if quality > 0.25 else "poor")
-        self.readouts["quality"].setText(f"{label} {quality:.2f}")
-        self.readouts["quality"].setStyleSheet(
-            "font-size:30px; font-weight:600; color:"
-            + (GOOD if quality > 0.45 else WARN if quality > 0.25 else BAD) + ";")
-
+        # What does separate them is the presence statistic below: wall 2.4, people 26-30.
         self.readouts["presence"].setText("nobody" if not present else "person")
         self.readouts["presence"].setStyleSheet(
             f"font-size:30px; font-weight:600; color:{'#8b949e' if not present else GOOD};")
