@@ -37,11 +37,47 @@ INTER = FEATURE_NAMES.index("inter")
 # (wall 21.0, person 18.8 - a wall is a strong reflector).
 #
 # What does separate them is time. Nobody holds still for a minute: heartbeat, sway and
-# micro-motion keep accumulating. A wall does not. Over a 60 s trailing median the least
-# active occupied minute of any recording scores 10.8 and the most active wall minute scores
-# 8.1, which separates with every session on the right side.
-PRESENCE_WINDOW_S = 60.0
-PRESENCE_THRESHOLD = 9.5  # midway between wall 8.1 and occupied 10.8
+# micro-motion keep accumulating. A wall does not.
+#
+# The statistic has to be a HIGH QUANTILE, and a breath hold on the demo rig is what proved
+# it. A trailing MEDIAN cannot work, because a 30 s apnea is half a 60 s window: the gate
+# was deciding presence from `inter`, the same score that collapses during an apnea, so the
+# apnea dragged its own presence evidence under the threshold and the gate concluded the
+# subject had left. Measured, the 60 s median during a real hold reaches 7.7 - BELOW the
+# most active wall minute at 8.1. The gate was not merely mis-tuned, it was inverted: a
+# person holding their breath scored as less present than a wall, and the alarm was
+# cancelled at the moment it mattered.
+#
+# A trailing 75th percentile over two minutes cannot be pulled down that way, because the
+# pre-hold breathing stays inside the window. Measured across every recording: least active
+# occupied window 19.6, worst window during any labelled hold 16.7, most active wall window
+# 9.2. That separates with 7.4 to spare, where the median separated with -0.4.
+PRESENCE_WINDOW_S = 120.0
+PRESENCE_QUANTILE = 0.75
+PRESENCE_THRESHOLD = 13.0  # midway between wall 9.2 and the worst hold 16.7
+
+
+def presence_activity(inter: np.ndarray, fs: float) -> np.ndarray:
+    """Trailing high quantile of the slow-motion score: "somebody was moving recently".
+
+    Causal - each sample sees only its own past. Shared with the scope so the panel that
+    explains the gate cannot drift from the gate itself; they used to compute this
+    separately and a change to one silently left the other behind.
+    """
+    window = int(PRESENCE_WINDOW_S * fs)
+    # Evaluated every STRIDE frames and held in between. Presence is a question about the
+    # last two minutes; resolving it to a twentieth of a second is meaningless precision
+    # bought at 10x the cost. Holding the previous value keeps it causal - a sample never
+    # sees anything newer than itself.
+    stride = max(1, int(0.5 * fs))
+    out = np.empty(len(inter))
+    last = 0.0
+    for i in range(len(inter)):
+        if i % stride == 0:
+            last = float(np.quantile(inter[max(0, i - window + 1) : i + 1],
+                                     PRESENCE_QUANTILE))
+        out[i] = last
+    return out
 
 
 class PresenceGatedDetector:
@@ -58,29 +94,26 @@ class PresenceGatedDetector:
             self.inner.fit(clips)
 
     def _left_the_room(self, clip: Clip) -> np.ndarray:
-        """True where nobody appears to be in front of the sensor."""
+        """True where nobody appears to be in front of the sensor.
+
+        A partial window is used as-is rather than suppressed. An occupied scene reads high
+        from the first seconds, so there is no need to wait: blanket-suppressing the first
+        window swallows every hold that begins at 30 s, which cost five of thirteen.
+        """
         fs = 1 / max(float(np.median(np.diff(clip.t))), 1e-6)
-        window = int(PRESENCE_WINDOW_S * fs)
-        inter = clip.X[:, INTER]
+        quiet = presence_activity(clip.X[:, INTER], fs) < PRESENCE_THRESHOLD
 
-        # Trailing median, causal: each sample sees only its own past.
-        #
-        # Evaluated every STRIDE frames and held in between, rather than recomputed for each
-        # one. Presence is a question about the last minute; resolving it to a twentieth of
-        # a second is meaningless precision bought at 10x the cost. Holding the previous
-        # value keeps it causal - a sample never sees anything newer than itself.
-        stride = max(1, int(0.5 * fs))
-        activity = np.empty(len(inter))
-        last = 0.0
-        for i in range(len(inter)):
-            if i % stride == 0:
-                last = float(np.median(inter[max(0, i - window + 1) : i + 1]))
-            activity[i] = last
-
-        # A partial window is used as-is rather than suppressed. An occupied scene reads high
-        # from the first seconds, so there is no need to wait: blanket-suppressing the first
-        # window swallows every hold that begins at 30 s, which cost five of thirteen.
-        return activity < PRESENCE_THRESHOLD
+        # `absent_s` of CONTINUOUS quiet before concluding the room is empty. This used to be
+        # a constructor argument that nothing read - the debounce it names was never written,
+        # which is how a single dip below the threshold could cancel an alarm outright.
+        # Somebody does not leave instantaneously, and a momentary dip is not a departure.
+        need = int(self.absent_s * fs)
+        left = np.zeros(len(quiet), dtype=bool)
+        run = 0
+        for i, q in enumerate(quiet):
+            run = run + 1 if q else 0
+            left[i] = run >= need
+        return left
 
     def predict(self, clip: Clip) -> np.ndarray:
         return self.inner.predict(clip) & ~self._left_the_room(clip)

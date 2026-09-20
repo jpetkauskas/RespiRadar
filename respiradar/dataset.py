@@ -60,6 +60,14 @@ SESSIONS: list[Session] = [
     Session("demo-holds", "nishant_demo_20260920-090443.h5", "nishant",
             holds=[Episode(60.0, 90.0)],
             description="talk+move, breathe, hold - recorded on the demo rig"),
+    # A second demo-rig recording with a DIFFERENT shape: breathing 0-30 s, hold 30-60 s.
+    # It exists because the first one had 60 s of history before its hold and this has 30,
+    # which is what exposed the presence gate - a 30 s apnea is half a 60 s window, so the
+    # apnea suppressed its own presence evidence. Keeping both shapes in SESSIONS is the
+    # point: one recording cannot tell you a detector generalises.
+    Session("demo-hold-early", "nishant_demo_20260920-092229.h5", "nishant",
+            holds=[Episode(30.0, 60.0)],
+            description="breathe then hold at 30 s - little history before the hold"),
     # justinas
     Session("justinas-sleeping-1", "justinas_sleeping_20260919-184132.h5", "justinas"),
     Session("justinas-sleeping-2", "justinas_sleeping_20260919-184458.h5", "justinas"),
