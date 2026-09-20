@@ -47,6 +47,8 @@ from collections import deque
 from pathlib import Path
 
 import numpy as np
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from scipy import signal as sig
 
 from respiradar.dataset import FEATURE_NAMES, FeatureExtractor
@@ -301,9 +303,17 @@ class ScopeFeed:
 
 
 def create_app(feed: ScopeFeed):
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-    from fastapi.responses import FileResponse
+    """Build the ASGI app.
 
+    FastAPI's imports are at MODULE level on purpose. This file uses
+    `from __future__ import annotations`, so every annotation is a string that FastAPI
+    resolves against the module's globals. Importing `WebSocket` inside this function left
+    `'WebSocket'` unresolvable, so FastAPI classified the `websocket` argument as a required
+    QUERY PARAMETER instead of the connection. Every handshake then failed validation and was
+    closed with 1008, which a browser reports as `HTTP 403` and the page shows as
+    "disconnected - retrying" with no data. `/` and `/snapshot` take no arguments, so they
+    kept working and hid it.
+    """
     app = FastAPI(title="RespiRadar scope")
 
     @app.get("/")

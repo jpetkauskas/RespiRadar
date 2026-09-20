@@ -200,3 +200,73 @@ class _NeverFits:
     def predict(self, clip):
         type(self).asked = True
         return np.zeros(len(clip.t), dtype=bool)
+
+
+# -- the websocket route ------------------------------------------------
+#
+# These exist because the route was broken for every real client while `/` and `/snapshot`
+# both worked, so nothing in this file noticed. The page loaded, the panels stayed empty, and
+# the only clue was "disconnected - retrying".
+
+
+def _app():
+    from respiradar.webscope import create_app
+
+    feed = ScopeFeed(iter(()), RadarConfig(sweeps_per_frame=8))
+    feed.worker.stop()
+    return create_app(feed)
+
+
+def test_the_websocket_route_takes_the_connection_not_a_query_parameter():
+    """`from __future__ import annotations` makes every annotation a string, and FastAPI
+    resolves those against the MODULE's globals. With `WebSocket` imported inside
+    `create_app`, `'WebSocket'` was unresolvable, so FastAPI classified the argument as a
+    required query parameter. Every handshake then failed validation and was closed with
+    1008, which a browser reports as HTTP 403.
+    """
+    route = next(r for r in _app().routes if getattr(r, "path", None) == "/ws")
+    assert route.dependant.websocket_param_name == "websocket"
+    assert [p.name for p in route.dependant.query_params] == []
+
+
+def test_the_websocket_accepts_a_connection_and_sends_a_payload():
+    """End to end over ASGI, no client library: connect, and see what comes back."""
+    import asyncio
+
+    app = _app()
+    scope = {
+        "type": "websocket", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "scheme": "ws", "path": "/ws", "raw_path": b"/ws", "query_string": b"",
+        "root_path": "", "headers": [(b"host", b"test")], "subprotocols": [],
+        "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 80),
+    }
+
+    async def drive():
+        inbox = asyncio.Queue()
+        await inbox.put({"type": "websocket.connect"})
+        seen = []
+
+        async def receive():
+            return await inbox.get()
+
+        async def send(message):
+            seen.append(message)
+            # Two payloads is enough to know it is streaming, not just accepting once.
+            if len([m for m in seen if m["type"] == "websocket.send"]) >= 2:
+                raise _Enough()
+
+        try:
+            await asyncio.wait_for(app(scope, receive, send), timeout=20)
+        except (_Enough, asyncio.TimeoutError, BaseExceptionGroup):
+            pass
+        return seen
+
+    seen = asyncio.run(drive())
+    kinds = [m["type"] for m in seen]
+    assert kinds, "the app sent nothing at all"
+    assert kinds[0] == "websocket.accept", f"connection was rejected: {seen[0]}"
+    assert "websocket.send" in kinds, f"accepted but never sent: {kinds}"
+
+
+class _Enough(Exception):
+    """Stop the endpoint's infinite push loop once we have seen enough."""
