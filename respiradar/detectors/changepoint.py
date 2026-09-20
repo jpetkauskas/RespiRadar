@@ -201,6 +201,27 @@ class Chart:
                 alarms[i] = True
         return alarms
 
+    def progress(self, clip: Clip, ctx: _Context, warm_s: float) -> np.ndarray:
+        """The chart's running total as a fraction of its threshold, for display.
+
+        Identical arithmetic to `run`, kept separate so the detector's hot path stays a
+        boolean. 1.0 means this chart is firing; 0 means it has just been reset by movement
+        or has no reference yet. Watching this is how you see WHY the alarm did or did not
+        come: a chart pinned at 0 is being reset, one creeping up is accumulating evidence.
+        """
+        statistic = sum(w * ctx.drops[name] for name, w in self.weights.items() if w)
+        increment = np.minimum(statistic - self.deadband, self.cap)
+        live = ctx.usable & ctx.calm & (clip.t >= clip.t[0] + warm_s)
+        out = np.zeros(len(clip.t))
+        total = 0.0
+        for i in range(len(clip.t)):
+            if not live[i]:
+                total = 0.0
+                continue
+            total = max(0.0, total * self.decay + increment[i])
+            out[i] = total / self.threshold
+        return out
+
 
 # Four charts, chosen by a two-stage random search (65 000 configurations) over the
 # leave-one-subject-out folds. Only configurations with no false alarm on any recording were
@@ -301,6 +322,15 @@ class ChangePointDetector:
         for chart in self.charts:
             alarms |= chart.run(clip, self._context(clip, chart), self.warm_s)
         return alarms
+
+    def progress(self, clip: Clip) -> dict:
+        """{chart note: running total / threshold} - what the scope draws."""
+        return {
+            chart.note.split(":")[0]: chart.progress(
+                clip, self._context(clip, chart), self.warm_s
+            )
+            for chart in self.charts
+        }
 
 
 # The two charts with the most margin: the highest thresholds and the strictest gates. The

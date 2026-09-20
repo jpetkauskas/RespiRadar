@@ -384,6 +384,26 @@ class Scope(QtWidgets.QMainWindow):
         self.now_line = pg.InfiniteLine(angle=90, pen=pg.mkPen(FG, width=1))
         self.p_det.addItem(self.now_line)
 
+        # 10. the detector's own internal state ----------------------------
+        self.p_cusum = self._panel(
+            3, 0,
+            "10 - INSIDE THE DETECTOR: each chart's evidence total (1.0 = fires)",
+            "total / threshold", "time (s)", colspan=3)
+        self.p_cusum.addLegend(offset=(10, 5))
+        self.cusum_curves = {}
+        for name, colour in zip(
+            ("patient", "presence", "energy", "8s energy"),
+            (GOOD, ACCENT, WARN, "#bc8cff"),
+        ):
+            self.cusum_curves[name] = self.p_cusum.plot(
+                pen=pg.mkPen(colour, width=2), name=name)
+        fire = pg.InfiniteLine(angle=0, pos=1.0,
+                               pen=pg.mkPen(BAD, width=2, style=QtCore.Qt.DashLine))
+        self.p_cusum.addItem(fire)
+        self.p_cusum.setYRange(0, 1.4)
+        self._progress = None
+        self._progress_at = -1
+
         for c in range(3):
             self.win.ci.layout.setColumnStretchFactor(c, 1)
 
@@ -474,6 +494,28 @@ class Scope(QtWidgets.QMainWindow):
                 self.spec_peak.show()
             else:
                 self.spec_peak.hide()
+
+        # Panel 10: how close each CUSUM chart is to firing. Recomputed about once a second
+        # - it replays the charts over the window, which is the detector's expensive part.
+        if self._progress is None or i - self._progress_at > int(fs):
+            try:
+                from respiradar.bakeoff import Clip
+                from respiradar.detectors import changepoint
+                if not hasattr(self, "_cusum_detector"):
+                    from respiradar.bakeoff import folds
+                    self._cusum_detector = changepoint.build()
+                    self._cusum_detector.fit(folds()[0][0])
+                j0 = max(0, i - int(WINDOW_S * fs))
+                sub = Clip("live", t[j0 : i + 1], d["features"][j0 : i + 1],
+                           np.zeros(i + 1 - j0, bool), [])
+                self._progress = (t[j0 : i + 1], self._cusum_detector.progress(sub))
+                self._progress_at = i
+            except Exception:
+                self._progress = None
+        if self._progress:
+            pt, charts = self._progress
+            for (name, curve), key in zip(self.cusum_curves.items(), charts):
+                curve.setData(pt, charts[key])
 
         self.c_det.setData(t[lo : i + 1], d["alarms"][lo : i + 1].astype(float))
         self.now_line.setPos(t[i])
