@@ -27,9 +27,21 @@ from respiradar.detectors import changepoint, ensemble
 INTRA = FEATURE_NAMES.index("intra")
 INTER = FEATURE_NAMES.index("inter")
 
-# PresenceDetector's own thresholds, which separate every real recording (91-100% present)
-# from an empty room (0%) with a wide margin.
-PRESENCE_THRESHOLD = 6.0
+# Presence is decided on a SLOW statistic, not a per-frame one.
+#
+# The obvious test - is the presence score above a threshold right now - does not work, and
+# a real recording of a wall is what proved it. Instantaneous slow-motion scores overlap
+# badly: the wall spikes to 15.2 while a person holding their breath drops to 2.7. Per frame
+# the two are not separable, because a perfectly still person and an empty room are very
+# nearly the same observation for a motion sensor. Reflected amplitude does not help either
+# (wall 21.0, person 18.8 - a wall is a strong reflector).
+#
+# What does separate them is time. Nobody holds still for a minute: heartbeat, sway and
+# micro-motion keep accumulating. A wall does not. Over a 60 s trailing median the least
+# active occupied minute of any recording scores 10.8 and the most active wall minute scores
+# 8.1, which separates with every session on the right side.
+PRESENCE_WINDOW_S = 60.0
+PRESENCE_THRESHOLD = 9.5  # midway between wall 8.1 and occupied 10.8
 
 
 class PresenceGatedDetector:
@@ -46,18 +58,29 @@ class PresenceGatedDetector:
             self.inner.fit(clips)
 
     def _left_the_room(self, clip: Clip) -> np.ndarray:
+        """True where nobody appears to be in front of the sensor."""
         fs = 1 / max(float(np.median(np.diff(clip.t))), 1e-6)
-        need = int(self.absent_s * fs)
+        window = int(PRESENCE_WINDOW_S * fs)
+        inter = clip.X[:, INTER]
 
-        present = (clip.X[:, INTRA] > PRESENCE_THRESHOLD) | (
-            clip.X[:, INTER] > PRESENCE_THRESHOLD
-        )
-        gone = np.zeros(len(clip.t), dtype=bool)
-        run = 0
-        for i, p in enumerate(present):
-            run = 0 if p else run + 1
-            gone[i] = run >= need
-        return gone
+        # Trailing median, causal: each sample sees only its own past.
+        #
+        # Evaluated every STRIDE frames and held in between, rather than recomputed for each
+        # one. Presence is a question about the last minute; resolving it to a twentieth of
+        # a second is meaningless precision bought at 10x the cost. Holding the previous
+        # value keeps it causal - a sample never sees anything newer than itself.
+        stride = max(1, int(0.5 * fs))
+        activity = np.empty(len(inter))
+        last = 0.0
+        for i in range(len(inter)):
+            if i % stride == 0:
+                last = float(np.median(inter[max(0, i - window + 1) : i + 1]))
+            activity[i] = last
+
+        # A partial window is used as-is rather than suppressed. An occupied scene reads high
+        # from the first seconds, so there is no need to wait: blanket-suppressing the first
+        # window swallows every hold that begins at 30 s, which cost five of thirteen.
+        return activity < PRESENCE_THRESHOLD
 
     def predict(self, clip: Clip) -> np.ndarray:
         return self.inner.predict(clip) & ~self._left_the_room(clip)

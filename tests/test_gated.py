@@ -48,14 +48,21 @@ def test_the_gate_is_what_makes_the_difference():
     assert ungated.predict(clip)[clip.t >= 25].any()
 
 
-def test_the_gate_costs_nothing_on_real_recordings():
+def test_the_gate_costs_no_detections_and_removes_false_alarms():
+    """The gate must be free on holds and strictly better on empty scenes.
+
+    It used to be free in both directions, because the only empty room available was
+    simulated and nothing alarmed at it anyway. With a real wall recording scored, the
+    ungated detector alarms and the gated one does not - so the gate now earns its place
+    rather than merely costing nothing.
+    """
     from respiradar.bakeoff import score
 
     gated = score(build())
     plain = score(build_conservative())
 
     assert gated.detected == plain.detected
-    assert gated.false_alarms == plain.false_alarms
+    assert gated.false_alarms <= plain.false_alarms
 
 
 def test_the_shipped_detector_is_not_obviously_broken():
@@ -137,3 +144,33 @@ def test_the_live_detector_stays_silent_on_a_subject_with_no_holds():
 
     settled = np.asarray(times) >= 25
     assert not np.asarray(live.alarms)[settled].any()
+
+
+def test_the_shipped_detector_is_silent_at_a_wall():
+    """A real empty scene, not a simulated one.
+
+    Pointed at a wall the scope reported a confident 16.1 bpm and "breathing". Two causes:
+    the readout took the largest peak in a band of noise, and presence was decided per
+    frame. A wall spikes to 15.2 on the slow-motion score while a person holding their
+    breath drops to 2.7, so no per-frame threshold separates them - only time does.
+    """
+    import numpy as np
+
+    from respiradar.bakeoff import Clip, folds
+    from respiradar.dataset import FeatureExtractor, session_by_name
+    from respiradar.detectors.gated import build_best
+    from respiradar.sources import recorded_config, replay_frames
+
+    session = session_by_name("wall")
+    extractor = FeatureExtractor(recorded_config(session.path))
+    times, rows = [], []
+    for frame in replay_frames(session.path):
+        times.append(frame.t)
+        rows.append(extractor.process(frame))
+
+    t = np.asarray(times)
+    clip = Clip("wall", t, np.asarray(rows), np.zeros(len(t), bool), [])
+    detector = build_best()
+    detector.fit(folds()[0][0])
+
+    assert not detector.predict(clip)[t >= 25].any()
