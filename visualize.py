@@ -475,6 +475,18 @@ class Scope(QtWidgets.QMainWindow):
             else:
                 self.spec_peak.hide()
 
+        self.c_det.setData(t[lo : i + 1], d["alarms"][lo : i + 1].astype(float))
+        self.now_line.setPos(t[i])
+
+        # Is anyone actually there? The same slow statistic the detector's gate uses: a
+        # 60 s trailing median of the slow-motion score. Per-frame values cannot tell a
+        # still person from a wall, and without this check the panels happily report a
+        # breathing rate for an empty room - the largest peak in a band of noise is still
+        # a peak.
+        inter = d["features"][:, FEATURE_NAMES.index("inter")]
+        window = int(PRESENCE_WINDOW_S * fs)
+        present = float(np.median(inter[max(0, i - window + 1) : i + 1])) >= PRESENCE_THRESHOLD
+
         # Panel 9: the raw slow-motion score, its 60 s trailing median (what the gate
         # actually tests) and the threshold. When the blue line dips under the red dashes the
         # gate concludes nobody is there and silently cancels any alarm - so if the detector
@@ -490,18 +502,6 @@ class Scope(QtWidgets.QMainWindow):
             self.gate_veto.show()
         else:
             self.gate_veto.hide()
-
-        self.c_det.setData(t[lo : i + 1], d["alarms"][lo : i + 1].astype(float))
-        self.now_line.setPos(t[i])
-
-        # Is anyone actually there? The same slow statistic the detector's gate uses: a
-        # 60 s trailing median of the slow-motion score. Per-frame values cannot tell a
-        # still person from a wall, and without this check the panels happily report a
-        # breathing rate for an empty room - the largest peak in a band of noise is still
-        # a peak.
-        inter = d["features"][:, FEATURE_NAMES.index("inter")]
-        window = int(PRESENCE_WINDOW_S * fs)
-        present = float(np.median(inter[max(0, i - window + 1) : i + 1])) >= PRESENCE_THRESHOLD
 
         in_hold = any(h.start_s <= t[i] < h.end_s for h in d["holds"])
         alarming = bool(d["alarms"][i]) and present
