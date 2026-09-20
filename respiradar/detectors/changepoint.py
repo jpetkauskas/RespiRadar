@@ -332,6 +332,17 @@ class ChangePointDetector:
             for chart in self.charts
         }
 
+    def gate_state(self, clip: Clip) -> dict:
+        """Why the charts are being reset, per frame.
+
+        A chart pinned at zero has been reset every frame, and there are two quite different
+        reasons: `calm` is False because the subject is moving, or `usable` is False because
+        there is no trustworthy reference yet. They need opposite fixes, so the display has
+        to tell them apart.
+        """
+        ctx = self._context(clip, self.charts[0])
+        return {"calm": ctx.calm.copy(), "usable": ctx.usable.copy()}
+
 
 # The two charts with the most margin: the highest thresholds and the strictest gates. The
 # full bank is already silent on every recording, so this is no longer a false-alarm hedge;

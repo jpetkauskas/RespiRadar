@@ -271,6 +271,7 @@ class Scope(QtWidgets.QMainWindow):
             ("amp", "CHEST MOTION"),
             ("presence", "PRESENCE"),
             ("rate", "FRAME RATE"),
+            ("gate", "CHART GATE"),
             ("state", "STATUS"),
         ]:
             box = QtWidgets.QVBoxLayout()
@@ -509,6 +510,7 @@ class Scope(QtWidgets.QMainWindow):
                 sub = Clip("live", t[j0 : i + 1], d["features"][j0 : i + 1],
                            np.zeros(i + 1 - j0, bool), [])
                 self._progress = (t[j0 : i + 1], self._cusum_detector.progress(sub))
+                self._gate_state = self._cusum_detector.gate_state(sub)
                 self._progress_at = i
             except Exception:
                 self._progress = None
@@ -576,6 +578,22 @@ class Scope(QtWidgets.QMainWindow):
         self.readouts["rate"].setText(f"{measured:.1f} Hz" if measured else "--")
         self.readouts["rate"].setStyleSheet(
             f"font-size:30px; font-weight:600; color:{BAD if bad else GOOD};")
+
+        # Why the CUSUM charts are being reset, if they are.
+        gs = getattr(self, "_gate_state", None)
+        if gs is not None and len(gs["calm"]):
+            calm = bool(gs["calm"][-1]); usable = bool(gs["usable"][-1])
+            if not calm:
+                gate_txt, gate_col = "moving", WARN
+            elif not usable:
+                gate_txt, gate_col = "no reference", WARN
+            else:
+                gate_txt, gate_col = "accumulating", GOOD
+        else:
+            gate_txt, gate_col = "--", "#8b949e"
+        self.readouts["gate"].setText(gate_txt)
+        self.readouts["gate"].setStyleSheet(
+            f"font-size:30px; font-weight:600; color:{gate_col};")
 
         self.readouts["presence"].setText("nobody" if not present else "person")
         self.readouts["presence"].setStyleSheet(
