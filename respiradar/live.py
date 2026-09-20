@@ -51,12 +51,25 @@ def fit_on_everything(detector):
 class LiveDetector:
     """Feeds frames through the feature extractor and a detector, one at a time."""
 
-    def __init__(self, config: RadarConfig, detector, buffer_s: float = BUFFER_S) -> None:
+    def __init__(
+        self,
+        config: RadarConfig,
+        detector,
+        buffer_s: float = BUFFER_S,
+        evaluate_every_s: float | None = EVALUATE_EVERY_S,
+    ) -> None:
         self.config = config
         self.detector = fit_on_everything(detector)
         self.extractor = FeatureExtractor(config)
         self.max_frames = int(buffer_s * config.frame_rate)
-        self.every = max(1, int(EVALUATE_EVERY_S * config.frame_rate))
+        # `None` means never evaluate from `process`. Re-running a detector over the buffer
+        # costs O(n): measured on this corpus, a 300 s buffer takes ~1.9 s per evaluation on
+        # a laptop, against the 0.5 s cadence asked of it. A caller that cannot afford to
+        # block - anything driving a display - takes `None` and calls `evaluate()` on its own
+        # thread instead.
+        self.every = None if evaluate_every_s is None else max(
+            1, int(evaluate_every_s * config.frame_rate)
+        )
 
         self.times: list[float] = []
         self.rows: list[np.ndarray] = []
@@ -74,15 +87,27 @@ class LiveDetector:
             self.alarms.pop(0)
 
         self._since_eval += 1
-        if self._since_eval >= self.every and len(self.times) > 40:
+        if self.every is not None and self._since_eval >= self.every and len(self.times) > 40:
             self._since_eval = 0
             self.alarm = self._evaluate()
         self.alarms.append(self.alarm)
         return row
 
-    def _evaluate(self) -> bool:
-        t = np.asarray(self.times)
-        X = np.asarray(self.rows)
+    def evaluate(self, snapshot=None) -> bool:
+        """Run the detector and return its current verdict.
+
+        `snapshot` is an optional (times, rows) pair taken by the caller, so a background
+        thread can copy the buffer under its own lock and then spend the O(n) prediction
+        without holding anything the frame loop needs.
+        """
+        return self._evaluate(snapshot)
+
+    def _evaluate(self, snapshot=None) -> bool:
+        times, rows = snapshot if snapshot is not None else (self.times, self.rows)
+        if len(times) <= 40:
+            return self.alarm
+        t = np.asarray(times)
+        X = np.asarray(rows)
         clip = Clip("live", t, X, np.zeros(len(t), dtype=bool), [])
         try:
             return bool(np.asarray(self.detector.predict(clip))[-1])

@@ -1,0 +1,5 @@
+# Python packages the Linux half needs, on top of what App Lab ships.
+# Install into the App Lab environment on the board:  pip install -r unoq/requirements.txt
+numpy
+scipy
+acconeer-exptool[algo]==7.18.2

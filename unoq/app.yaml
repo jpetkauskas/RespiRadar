@@ -1,0 +1,5 @@
+name: RespiRadar
+icon: 🫁
+description:
+  Contactless breathing monitor. A 60 GHz radar watches a chest from across the room and the
+  LED matrix shows the breathing wave, whether anyone is there, and an apnea alarm.
