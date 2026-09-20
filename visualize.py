@@ -166,7 +166,10 @@ class LiveSource:
 
         mod = importlib.import_module(f"respiradar.detectors.{detector_name}")
         build = getattr(mod, "build_best", mod.build)
-        self.live = LiveDetector(config, build())
+        # background=True: evaluation must not run in this thread. `_run` below pulls
+        # frames straight off the serial link, and a detector that blocks it for seconds
+        # backs the XM125 up until the stream desynchronises. See live.LiveDetector.
+        self.live = LiveDetector(config, build(), background=True)
         self.frames = frames
         self.config = config
         self.fs = config.frame_rate

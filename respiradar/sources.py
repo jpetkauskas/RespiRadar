@@ -186,10 +186,17 @@ def radar_frames(
                 delayed=bool(result.frame_delayed),
             )
     finally:
-        client.stop_session()
-        if recorder is not None:
-            recorder.close()
-        client.close()
+        # Best-effort teardown. If the link has already failed, `stop_session` raises
+        # "Client is not connected" from inside the `finally`, which REPLACES whatever went
+        # wrong - so a dropped-byte stream desync gets reported as a tidy connection error
+        # and the real cause is lost. Each step is guarded so the original exception survives.
+        for step in (client.stop_session, recorder.close if recorder else None, client.close):
+            if step is None:
+                continue
+            try:
+                step()
+            except Exception:
+                pass
 
 
 def simulated_frames(

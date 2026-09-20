@@ -18,6 +18,8 @@ Two practical concessions:
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 
 from respiradar.bakeoff import Clip
@@ -26,6 +28,15 @@ from respiradar.sources import Frame, RadarConfig
 
 BUFFER_S = 300.0
 EVALUATE_EVERY_S = 0.5
+
+# How much of the buffer an evaluation actually looks at, in `background` mode.
+#
+# Evaluation cost grows faster than linearly with buffer length, because `rhythm` and
+# `spectral` re-derive their own features from the raw frames every time. Measured on a
+# laptop, one `_evaluate` over the full 300 s buffer takes 36.7 s - against the 0.5 s cadence
+# it is asked for. 90 s costs a second or two, and is still more history than anything
+# downstream needs: the presence gate's median is 60 s and `changepoint`'s warm-up is 20 s.
+EVALUATE_WINDOW_S = 90.0
 
 
 def fit_on_everything(detector):
@@ -52,7 +63,8 @@ class LiveDetector:
     """Feeds frames through the feature extractor and a detector, one at a time."""
 
     def __init__(self, config: RadarConfig, detector, buffer_s: float = BUFFER_S,
-                 aux=("rhythm", "spectral")) -> None:
+                 aux=("rhythm", "spectral"), background: bool = False,
+                 evaluate_window_s: float = EVALUATE_WINDOW_S) -> None:
         self.config = config
         self.detector = fit_on_everything(detector)
         self.extractor = FeatureExtractor(config)
@@ -79,33 +91,81 @@ class LiveDetector:
         self.alarms: list[bool] = []
         self._since_eval = 0
 
-    def process(self, frame: Frame) -> np.ndarray:
-        row = self.extractor.process(frame)
-        self.times.append(frame.t)
-        self.rows.append(row)
-        if self.aux:
-            self.frames_buffer.append(frame)
-        if len(self.times) > self.max_frames:
-            self.times.pop(0)
-            self.rows.pop(0)
-            self.alarms.pop(0)
-            if self.frames_buffer:
-                self.frames_buffer.pop(0)
+        # BACKGROUND MODE, for anything reading a real sensor.
+        #
+        # `process` is called from the same loop that pulls frames off the serial link, and
+        # evaluating inline means nobody calls `client.get_next()` for as long as it takes.
+        # The XM125 keeps streaming regardless, so the frames pile up in the serial buffer -
+        # "Server timestamp was from 3.68s ago" - until it overflows, bytes are dropped, and
+        # the message stream desynchronises into `Cannot decode header`. That is a crash, not
+        # a slowdown, and it is what a live scope hits within about two minutes.
+        #
+        # So the sensor loop only extracts features (~0.6 ms a frame) and this thread does the
+        # expensive part. A stale verdict costs nothing here: an apnea alarm has ~20 s of
+        # latency by nature.
+        #
+        # Off by default, because replaying a recording as fast as possible wants the
+        # deterministic inline path - `tests/test_gated.py` reads `alarms` frame by frame.
+        self.background = background
+        self.evaluate_frames = max(1, int(evaluate_window_s * config.frame_rate))
+        self.lock = threading.RLock()
+        self._stop = threading.Event()
+        self._thread = None
+        if background:
+            self._thread = threading.Thread(target=self._evaluate_forever, daemon=True)
+            self._thread.start()
 
-        self._since_eval += 1
-        if self._since_eval >= self.every and len(self.times) > 40:
-            self._since_eval = 0
-            self.alarm = self._evaluate()
-        self.alarms.append(self.alarm)
+    def stop(self) -> None:
+        self._stop.set()
+
+    def process(self, frame: Frame) -> np.ndarray:
+        with self.lock:
+            row = self.extractor.process(frame)
+            self.times.append(frame.t)
+            self.rows.append(row)
+            if self.aux:
+                self.frames_buffer.append(frame)
+            if len(self.times) > self.max_frames:
+                self.times.pop(0)
+                self.rows.pop(0)
+                self.alarms.pop(0)
+                if self.frames_buffer:
+                    self.frames_buffer.pop(0)
+
+            if not self.background:
+                self._since_eval += 1
+                if self._since_eval >= self.every and len(self.times) > 40:
+                    self._since_eval = 0
+                    self.alarm = self._evaluate()
+            self.alarms.append(self.alarm)
         return row
 
-    def _evaluate(self) -> bool:
-        t = np.asarray(self.times)
-        X = np.asarray(self.rows)
+    def _evaluate_forever(self) -> None:
+        while not self._stop.is_set():
+            # Copy under the lock, evaluate outside it. The frame loop must never wait on an
+            # evaluation - that is the whole point of this thread.
+            with self.lock:
+                k = min(len(self.times), self.evaluate_frames)
+                snapshot = (
+                    list(self.times[-k:]),
+                    list(self.rows[-k:]),
+                    list(self.frames_buffer[-k:]) if self.frames_buffer else [],
+                )
+            if len(snapshot[0]) > 40:
+                self.alarm = self._evaluate(snapshot)
+            self._stop.wait(EVALUATE_EVERY_S)
+
+    def _evaluate(self, snapshot=None) -> bool:
+        if snapshot is None:
+            times, rows, frames = self.times, self.rows, self.frames_buffer
+        else:
+            times, rows, frames = snapshot
+        t = np.asarray(times)
+        X = np.asarray(rows)
         clip = Clip("live", t, X, np.zeros(len(t), dtype=bool), [])
         for module in self.aux:
             try:
-                at, aX = module.extract(self.frames_buffer, self.config)
+                at, aX = module.extract(frames, self.config)
                 module.register("live", at, aX)
             except Exception:
                 pass  # a detector that cannot supply its own features falls back
