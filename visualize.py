@@ -81,7 +81,7 @@ BAD = "#f85149"
 DIM = "#30363d"
 
 
-def extract(session, detector_name: str = "spectral"):
+def extract(session, detector_name: str = "gated"):
     """Run the pipeline once, keeping every intermediate the panels need."""
     config = recorded_config(session.path)
     ex = FeatureExtractor(config)
@@ -138,7 +138,10 @@ def _run_detector(session, data, name):
     for module in (name, "spectral", "changepoint"):
         try:
             mod = importlib.import_module(f"respiradar.detectors.{module}")
-            det = mod.build()
+            # build_best where a module offers it, matching what LiveSource runs. Replaying
+            # with a different build than the sensor uses lets a live failure hide behind a
+            # clean replay, which is exactly what happened.
+            det = getattr(mod, "build_best", mod.build)()
             if hasattr(det, "fit"):
                 from respiradar.bakeoff import folds
 
@@ -519,7 +522,10 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--session", default="nishant-holds-2401",
                         help="recorded session to replay")
-    parser.add_argument("--detector", default="spectral")
+    # Same detector on both paths. Replaying with one detector while the sensor runs another
+    # means the demo and the live run disagree, which is how a live failure hides behind a
+    # clean replay.
+    parser.add_argument("--detector", default="gated")
     parser.add_argument("--speed", type=float, default=2.0, help="replay frames per tick")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--port", help="live: serial port of the XM125")
