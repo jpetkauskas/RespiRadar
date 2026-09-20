@@ -46,13 +46,12 @@ from respiradar.dataset import FEATURE_NAMES
 
 RMS4 = FEATURE_NAMES.index("rms_4s")
 RMS8 = FEATURE_NAMES.index("rms_8s")
-RMS16 = FEATURE_NAMES.index("rms_16s")
-BASE = FEATURE_NAMES.index("baseline")
+RATCHET = FEATURE_NAMES.index("ref_ratchet")   # == the old `baseline` column
+REF_Q = FEATURE_NAMES.index("ref_q25")         # non-ratcheting trailing 25th percentile
+HISTORY = FEATURE_NAMES.index("seconds_of_history")
 INTRA = FEATURE_NAMES.index("intra")
 INTER = FEATURE_NAMES.index("inter")
 DISP = FEATURE_NAMES.index("disp_std_4s")
-AC = FEATURE_NAMES.index("autocorr")
-FLAT = FEATURE_NAMES.index("flatness")
 
 EPS = 1e-6
 
@@ -84,40 +83,52 @@ class _Context:
 
     __slots__ = ("fs", "usable", "drops", "calm")
 
-    def __init__(self, clip: Clip, window_s: float, gap_s: float, gate: dict) -> None:
+    def __init__(self, clip: Clip, window_s: float, gap_s: float, gate: dict,
+                 history_s: float) -> None:
         X = clip.X
         # Rounded, because the raw estimate wobbles in the last decimal place with the
         # number of frames seen so far, and an off-by-one window length would make the
         # detector's output depend on how much future there happens to be.
         self.fs = fs = round(1 / max(float(np.median(np.diff(clip.t))), 1e-6), 3)
-        # rms_16s is zero until the 16 s buffer has filled, which is also the moment the
-        # feature extractor starts keeping a baseline. Before that there is nothing to
-        # compare against and the chart stays at zero.
-        self.usable = usable = X[:, RMS16] > 0
+        # How much history the extractor had at this frame. The windowed statistics are
+        # defined from 2 s onwards now, but a reference built from four seconds of a
+        # start-up transient is not a reference, so each chart names its own minimum.
+        self.usable = usable = X[:, HISTORY] >= history_s
         window, gap = int(window_s * fs), int(gap_s * fs)
 
-        log_base = np.log(np.maximum(X[:, BASE], EPS))
+        log_ratchet = np.log(np.maximum(X[:, RATCHET], EPS))
+        log_q = np.log(np.maximum(X[:, REF_Q], EPS))
 
-        def drop(raw, use_baseline=False):
+        def drop(raw, floor=None):
             ref, ok = _trailing_quantile(raw, usable, window, gap, 0.5, int(4 * fs))
-            if use_baseline:
-                ref = np.where(ok & usable, np.minimum(log_base, ref), log_base)
-            else:
+            if floor is None:
                 ref = np.where(ok, ref, raw)
+            else:
+                ref = np.where(ok & usable, np.minimum(floor, ref), floor)
             return ref - raw          # positive = below this person's own normal
 
         log4 = np.log(np.maximum(X[:, RMS4], EPS))
+        log8 = np.log(np.maximum(X[:, RMS8], EPS))
         self.drops = {
-            # against the shipped baseline only: the fastest channel, because the baseline
-            # does not follow the hold down at all
-            "ratio": log_base - log4,
-            # the same, over 8 s: half the noise, half the speed
-            "ratio_8": log_base - np.log(np.maximum(X[:, RMS8], EPS)),
-            # against the trailing reference as well: slower, but immune to an inflated
-            # baseline after a burst of movement
-            "energy": drop(log4, use_baseline=True),
-            # the presence processor's slow-motion score, an independent estimate of chest
-            # movement that does not share the band-pass filter's failure modes
+            # Against the ratcheting reference. It rises fast and falls only very slowly,
+            # which is a liability on negatives - a burst of movement leaves it inflated for
+            # minutes - but exactly what a *fast* channel wants, because a reference that
+            # refuses to follow a hold downwards keeps the step visible for the whole hold.
+            "ratio": log_ratchet - log4,
+            "ratio_8": log_ratchet - log8,
+            # Against the shared non-ratcheting 25th-percentile reference. Far better
+            # behaved on negatives: its level sits in a narrow band across subjects where
+            # the ratchet's wanders from 0.14 to 0.79, which is why fixed thresholds on the
+            # ratchet do not transfer. It does drift down inside a hold longer than about
+            # half its window, so it is the slow channel's reference, not the fast one's.
+            "ratio_q": log_q - log4,
+            "ratio_q8": log_q - log8,
+            # A trailing median of my own, floored by the ratchet: takes the lower of the
+            # two, so an inflated ratchet cannot manufacture a drop.
+            "energy": drop(log4, floor=log_ratchet),
+            # The presence processor's slow-motion score. An independent estimate of chest
+            # movement that does not share the band-pass filter's failure modes, and by a
+            # wide margin the best-separating and most subject-stable channel here.
             "inter": drop(np.log(np.maximum(X[:, INTER], 1e-3))),
         }
 
@@ -139,13 +150,14 @@ class Chart:
     """One CUSUM chart: a weighted drop statistic, a deadband, a cap and a threshold."""
 
     def __init__(self, weights, deadband, cap, threshold, window_s=60.0, gap_s=4.0,
-                 gate=None, decay=1.0, refractory_s=0.0, note=""):
+                 gate=None, decay=1.0, refractory_s=0.0, history_s=16.0, note=""):
         self.weights = dict(weights)
         self.deadband = deadband
         self.cap = cap
         self.threshold = threshold
         self.window_s = window_s
         self.gap_s = gap_s
+        self.history_s = history_s
         self.gate = gate or dict(intra_k=2.0, intra_abs=2.5, disp_k=2.0, disp_floor_k=0.15)
         # A forgetting factor slightly below 1 turns the chart into a rate detector: a small
         # positive drift saturates at a low level, so an hour of slightly shallow breathing
@@ -157,7 +169,7 @@ class Chart:
         self.note = note
 
     def key(self):
-        return (self.window_s, self.gap_s, tuple(sorted(self.gate.items())))
+        return (self.window_s, self.gap_s, self.history_s, tuple(sorted(self.gate.items())))
 
     def run(self, clip: Clip, ctx: _Context, warm_s: float) -> np.ndarray:
         statistic = sum(w * ctx.drops[name] for name, w in self.weights.items() if w)
@@ -250,7 +262,8 @@ class ChangePointDetector:
             cache["held"] = clip                   # keep a reference so `is` stays meaningful
             contexts = cache["ctx"] = {}
         if key not in contexts:
-            contexts[key] = _Context(clip, chart.window_s, chart.gap_s, chart.gate)
+            contexts[key] = _Context(clip, chart.window_s, chart.gap_s, chart.gate,
+                                     chart.history_s)
         return contexts[key]
 
     def predict(self, clip: Clip) -> np.ndarray:

@@ -65,6 +65,21 @@ SESSIONS: list[Session] = [
             description="breathe, hold, breathe, hold"),
     # vishnu - negatives only, but a third subject to train against
     Session("vishnu-sleeping", "vishnu_sleeping_20260919-183707.h5", "vishnu"),
+    # Second recording round: a scripted (30 s breathing, 30 s hold) x 3 per session, so the
+    # holds are uniform and - unlike the first round - none of them start inside the filter
+    # warmup. These nine holds are worth more than the original four: the in-hold breathing
+    # envelope separates at 0.18 of the out-of-hold level, against 0.62-0.71 before.
+    Session("nishant-holds-2401", "nishant_breath-hold_20260919-202401.h5", "nishant",
+            holds=[Episode(30.0, 60.0), Episode(90.0, 120.0), Episode(149.8, 179.0)],
+            description="scripted 30 s hold x 3"),
+    Session("nishant-holds-3008", "nishant_breath-hold_20260919-203008.h5", "nishant",
+            holds=[Episode(30.0, 60.0), Episode(90.0, 120.0), Episode(149.8, 179.0)],
+            description="scripted 30 s hold x 3"),
+    # Only five markers: the recording ends during the third hold, so its end is the end of
+    # the recording rather than a marked resumption.
+    Session("justinas-holds-3515", "justinas_breath-hold_20260919-203515.h5", "justinas",
+            holds=[Episode(30.2, 60.1), Episode(90.0, 120.2), Episode(151.9, 180.2)],
+            description="scripted 30 s hold x 3"),
 ]
 
 
