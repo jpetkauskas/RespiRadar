@@ -145,6 +145,88 @@ sensor flagged as delayed — if that's above zero, the link is oversubscribed.
 
 If connecting hangs, try `--no-flow-control` (RTS/CTS support varies by USB-serial bridge).
 
+## The scope, over the network
+
+`visualize.py` needs a screen and PySide6. To watch the same eight panels from a phone, a
+laptop, or anything else on the network, serve them instead:
+
+```bash
+uv run python -m respiradar.webscope                         # sensor if plugged in, else simulator
+uv run python -m respiradar.webscope --session breath-hold   # replay a recording, in real time
+uv run python -m respiradar.webscope --simulate --hold 35,30 # fake someone who stops breathing
+```
+
+It prints the URL to open, on this machine's LAN address. `--host 127.0.0.1` keeps it local;
+the default `0.0.0.0` is what makes it reachable from another device.
+
+`GET /snapshot` returns one frame of everything as JSON, which is the quickest way to see
+what the pipeline thinks without a browser:
+
+```bash
+curl -s http://localhost:8000/snapshot | python -m json.tool | head -30
+```
+
+The page is a single self-contained file (`respiradar/static/scope.html`) with no CDN, because
+the board serving it may have no route to the internet and neither may the phone looking at it.
+
+What goes over the wire is decimated: the time series drop to 256 points over the last 30 s,
+the range-time heatmap sends only its newest column and the browser scrolls its own canvas,
+and floats are rounded. That is ~13 KB a tick at 5 Hz. Sending the raw 20 Hz history would be
+tens of megabytes a minute, nearly all of it redrawing pixels that did not change.
+
+## The UNO Q LED matrix
+
+The Arduino UNO Q has an 8x13 LED matrix on its STM32, driven from the Linux side over the
+Router Bridge. `respiradar/ledmatrix.py` renders the breathing wave, whether anyone is there,
+and the apnea alarm onto it; `respiradar/unoq.py` runs the pipeline and pushes frames.
+
+Preview the exact same rendering anywhere, as text:
+
+```bash
+uv run python -m respiradar.unoq --selftest --sink terminal   # fixed patterns, no radar
+uv run python -m respiradar.unoq --simulate --sink terminal   # breathing
+uv run python -m respiradar.unoq --simulate --hold 35,30 --sink terminal   # watch it alarm
+uv run python -m respiradar.unoq --session justinas-holds-3515 --sink terminal
+```
+
+    +-------------+
+    |   :-:      -|    cols 0-11  the breathing wave, newest at the right
+    |  .:.::     -|    col 12     the status lamp: how sure we are somebody is there
+    |  :   -:    -|
+    |  .    :    -|    nobody there  a dim column sweeping across
+    | -     =:   -|    apnea         all 104 LEDs flashing at 2 Hz
+    |:.      +::#-|
+    |.       .== -|
+    +-------------+
+
+**On the board**, `unoq/` is an Arduino App Lab app: it flashes `sketch/sketch.ino` to the
+STM32 and runs `python/main.py` on Linux. Bring it up in this order, so a failure can only
+mean one thing:
+
+```bash
+sudo apt install -y python3-numpy python3-scipy     # enough for everything but the radar
+RESPIRADAR_SELFTEST=1    # eight fixed patterns - proves the Bridge and the matrix alone
+RESPIRADAR_SIMULATE=1    # the whole pipeline, no hardware
+                         # then unset both, and plug the XM125 in
+```
+
+The radar needs `acconeer-exptool`, which is not in apt:
+`pip install --break-system-packages 'acconeer-exptool[algo]==7.18.2'`. Do not `pip install -e .`
+on the board - `pyproject.toml` pulls in PySide6 and pyqtgraph, which are a long build on
+aarch64 and useless headless. `unoq/python/main.py` puts the checkout on `sys.path` itself.
+
+The XM125 enumerates as `/dev/ttyUSB0` once the CH340 driver is built (`bash build_ch341.sh`),
+and you need to be in `dialout`.
+
+### Why the alarm takes over the whole display
+
+The obvious design is to let the wave speak for itself: breathing stops, the trace goes flat.
+Measured against these recordings, it does not. The 90th percentile of the band-passed wave
+inside a labelled breath hold is 0.62-0.67 of its value outside one - 1.37 vs 2.21 mm on
+`breath-hold`, 1.59 vs 2.36 on `justinas-holds-3515`, 0.74 vs 1.12 on `nishant-holds-3008`.
+A third quieter is not "flat" on eight rows. So the alarm is not a subtlety in the trace: it
+blinks all 104 LEDs, alternating with the wave so the evidence is still there once you look.
+
 ## Layout
 
 - `main.py` — entry point
@@ -154,6 +236,10 @@ If connecting hangs, try `--no-flow-control` (RTS/CTS support varies by USB-seri
 - `respiradar/breathing.py` — phase → displacement → PSD → rate, plus the app-state machine
 - `respiradar/gui.py` — live pyqtgraph dashboard
 - `respiradar/server.py` + `static/index.html` — the browser dashboard (`python -m respiradar`)
+- `respiradar/webscope.py` + `static/scope.html` — every scope panel, over the network
+- `respiradar/ledmatrix.py` — renders the wave, presence and alarm to an 8x13 frame
+- `respiradar/unoq.py` + `unoq/` — the UNO Q LED matrix app
+- `respiradar/live.py` — runs a bake-off detector on a live sensor, off the frame thread
 
 ## Accuracy
 

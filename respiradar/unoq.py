@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import threading
 from collections import deque
 
 import numpy as np
@@ -29,7 +28,7 @@ from respiradar.dataset import FEATURE_NAMES
 from respiradar.detectors.gated import PRESENCE_THRESHOLD, PRESENCE_WINDOW_S
 from respiradar.evaluation import DEFAULT_WARMUP_S
 from respiradar.ledmatrix import MatrixRenderer, MatrixState, to_text
-from respiradar.live import LiveDetector
+from respiradar.live import AlarmWorker, LiveDetector
 from respiradar.sources import Frame, RadarConfig
 
 # The band breaths actually live in. `visualize.py` explains the choice at length: at the
@@ -80,50 +79,6 @@ class PresenceTracker:
     def ratio(self) -> float:
         """Activity as a multiple of the threshold. The status lamp's height comes from this."""
         return self.activity / PRESENCE_THRESHOLD
-
-
-class AlarmWorker:
-    """Runs the detector on its own thread, so a slow verdict never stalls the display.
-
-    The detectors are written against a whole `Clip` and re-run from scratch over the live
-    buffer, which costs O(n). Measured on this corpus: 49 ms over a 30 s buffer, 373 ms over
-    60 s, 1.9 s over the 300 s `live.BUFFER_S` default - against a 0.5 s cadence, on a laptop.
-    The UNO Q's A53s are several times slower again, so evaluating inline would drop the frame
-    rate to whatever the detector managed, and a frozen matrix is worse than a late alarm.
-
-    So: the frame loop only extracts features (0.63 ms/frame) and draws, and this thread loops
-    over the buffer as fast as it can, publishing a single bool. An apnea alarm has ~20 s of
-    latency by nature - a verdict that is a couple of seconds stale changes nothing, and the
-    wave stays at full frame rate, which is the part a person actually watches.
-    """
-
-    def __init__(self, live: LiveDetector) -> None:
-        self.live = live
-        self.alarm = False
-        self.lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def _loop(self) -> None:
-        while not self._stop.is_set():
-            with self.lock:
-                snapshot = (list(self.live.times), list(self.live.rows))
-            if len(snapshot[0]) <= 40:
-                self._stop.wait(0.2)
-                continue
-            try:
-                # Outside the lock: this is the expensive part, and the frame loop must not
-                # wait on it.
-                self.alarm = bool(self.live.evaluate(snapshot))
-            except Exception:
-                # A detector that cannot run live must not take the display down with it.
-                # Keep the last verdict and try again.
-                pass
-            self._stop.wait(0.1)
-
-    def stop(self) -> None:
-        self._stop.set()
 
 
 class MatrixFeed:
@@ -177,11 +132,15 @@ class TerminalSink:
     def __init__(self) -> None:
         self._drawn = False
 
-    def draw(self, frame: np.ndarray, state: MatrixState) -> None:
+    def draw(self, frame: np.ndarray, state: MatrixState | None) -> None:
         if self._drawn:
             sys.stdout.write(f"\033[{frame.shape[0] + 2}A")
         self._drawn = True
-        label = f"{state.display.value:<14} t={state.t:6.1f}s  presence={state.presence:4.2f}"
+        # `None` means a fixed pattern from the self-test, which is not a reading of
+        # anything - labelling it "breathing, presence 1.00" would be inventing data.
+        label = "" if state is None else (
+            f"{state.display.value:<14} t={state.t:6.1f}s  presence={state.presence:4.2f}"
+        )
         sys.stdout.write(f"\033[2K{label}\n\033[2K+{'-' * frame.shape[1]}+\n")
         for line in to_text(frame).splitlines():
             sys.stdout.write(f"\033[2K|{line}|\n")
@@ -218,6 +177,9 @@ class BridgeSink:
         board = self._Frame(np.asarray(frame, dtype=np.uint8))
         self._Bridge.call("draw", board.to_board_bytes())
 
+    def note(self, text: str) -> None:
+        print(text, flush=True)
+
     def close(self) -> None:
         """Leave the matrix dark rather than frozen on the last frame."""
         try:
@@ -251,6 +213,34 @@ def run(frames, config: RadarConfig, sink, detector=None, refresh_s: float = REF
         sink.close()
 
 
+def selftest(sink, seconds_each: float = 3.0, loop: bool = False) -> None:
+    """Walk the known patterns, so a wiring fault can be told from a rendering one.
+
+    Nothing here touches the radar. If this works and the radar does not, the problem is the
+    sensor; if this does not work, nothing else is worth debugging yet.
+    """
+    import time
+
+    from respiradar.ledmatrix import test_patterns
+
+    patterns = test_patterns()
+    try:
+        while True:
+            for n, (name, expect, frame) in enumerate(patterns, 1):
+                print(f"\n[{n}/{len(patterns)}] {name}: you should see {expect}", flush=True)
+                deadline = time.monotonic() + seconds_each
+                while time.monotonic() < deadline:
+                    # No state: these are fixed patterns, not a reading of anything.
+                    sink.draw(frame, None)
+                    time.sleep(0.1)
+            if not loop:
+                return
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sink.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     from respiradar.sources import find_serial_port, replay_frames, simulated_frames
 
@@ -268,6 +258,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="--simulate a breath hold, in seconds; repeatable")
     parser.add_argument("--speed", type=float, default=1.0,
                         help="--session playback speed; 0 for as fast as possible")
+    parser.add_argument("--selftest", action="store_true",
+                        help="walk known patterns to check the matrix; touches no radar")
+    parser.add_argument("--loop", action="store_true", help="--selftest: repeat forever")
+    parser.add_argument("--dwell", type=float, default=3.0,
+                        help="--selftest: seconds to hold each pattern")
     args = parser.parse_args(argv)
 
     if args.list:
@@ -275,6 +270,15 @@ def main(argv: list[str] | None = None) -> int:
 
         for session in SESSIONS:
             print(f"  {session.name:24s} {session.subject:9s} {len(session.holds)} holds")
+        return 0
+
+    sink_name = args.sink or ("bridge" if _on_uno_q() else "terminal")
+    make_sink = BridgeSink if sink_name == "bridge" else TerminalSink
+
+    # Before anything that might open a serial port: the point of the self-test is to prove
+    # the display alone, so it must not be able to fail for a radar reason.
+    if args.selftest:
+        selftest(make_sink(), seconds_each=args.dwell, loop=args.loop)
         return 0
 
     if args.session:
@@ -304,12 +308,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"XM125 on {port}: {config.frame_rate:.0f} Hz, "
               f"{config.sweeps_per_frame} sweeps x {config.num_points} bins")
 
-    sink_name = args.sink
-    if sink_name is None:
-        sink_name = "bridge" if _on_uno_q() else "terminal"
-    sink = BridgeSink() if sink_name == "bridge" else TerminalSink()
-
-    run(frames, config, sink)
+    run(frames, config, make_sink())
     return 0
 
 

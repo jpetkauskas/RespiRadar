@@ -6,10 +6,15 @@ scores. This file only picks a frame source and hands the loop over.
 
 Configuration is by environment variable, because App Lab has no argv to pass:
 
+    RESPIRADAR_SELFTEST   set to 1 to walk known LED patterns; touches no radar at all
     RESPIRADAR_PORT       serial port of the XM125 (default: autodetect, /dev/ttyUSB0)
     RESPIRADAR_BAUDRATE   default 230400
     RESPIRADAR_SIMULATE   set to 1 to run without a sensor, for testing the matrix
     RESPIRADAR_SESSION    replay a recording by name instead of reading the sensor
+
+Bring it up in that order. RESPIRADAR_SELFTEST=1 proves the Bridge and the matrix on their
+own; RESPIRADAR_SIMULATE=1 adds the whole signal pipeline but no hardware; only then does a
+failure mean anything about the radar.
 """
 
 import os
@@ -23,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from arduino.app_utils import App  # noqa: E402
 
 from respiradar.sources import RadarConfig, find_serial_port  # noqa: E402
-from respiradar.unoq import BridgeSink, run  # noqa: E402
+from respiradar.unoq import BridgeSink, run, selftest  # noqa: E402
 
 
 def frames_and_config():
@@ -61,6 +66,10 @@ def frames_and_config():
 
 
 def radar_loop():
+    if os.environ.get("RESPIRADAR_SELFTEST") == "1":
+        print("self-test: fixed LED patterns, no radar")
+        selftest(BridgeSink(), loop=True)
+        return
     frames, config = frames_and_config()
     run(frames, config, BridgeSink())
 

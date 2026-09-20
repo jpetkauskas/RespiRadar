@@ -248,3 +248,58 @@ def _lighten(frame: np.ndarray, row: int, col: int, level: float) -> None:
 def to_text(frame: np.ndarray, palette: str = " .:-=+*#") -> str:
     """The frame as text, for terminals and test failures. One character per LED."""
     return "\n".join("".join(palette[int(v)] for v in row) for row in frame)
+
+
+def test_patterns() -> list[tuple[str, str, np.ndarray]]:
+    """(name, what you should see, frame) for checking the wiring, hardest fault first.
+
+    Ordered so that each pattern only makes sense if the previous one passed. Run them on a
+    terminal sink first to learn what each is supposed to look like, then on the board: the
+    difference between the two is the fault.
+    """
+    patterns: list[tuple[str, str, np.ndarray]] = []
+
+    def add(name: str, expect: str, frame: np.ndarray) -> None:
+        patterns.append((name, expect, frame.astype(np.uint8)))
+
+    add("blank", "every LED off", np.zeros((ROWS, COLS), dtype=np.uint8))
+    add("full", f"all {ROWS * COLS} LEDs on, evenly, at full brightness",
+        np.full((ROWS, COLS), MAX, dtype=np.uint8))
+
+    # If the sketch's setGrayscaleBits does not match LEVELS, this is where it shows: the
+    # ramp either saturates to a solid block (board expects more levels than we send) or
+    # flickers dimly (board expects fewer).
+    ramp = np.tile(np.linspace(0, MAX, COLS).round(), (ROWS, 1))
+    add("ramp", "a smooth left-to-right gradient, dark at the left, full at the right", ramp)
+
+    corner = np.zeros((ROWS, COLS), dtype=np.uint8)
+    corner[0, 0] = MAX
+    add("corner", "exactly one LED, in the TOP-LEFT corner", corner)
+
+    top = np.zeros((ROWS, COLS), dtype=np.uint8)
+    top[0, :] = MAX
+    add("top row", f"one full horizontal line of {COLS} LEDs along the TOP edge", top)
+
+    status = np.zeros((ROWS, COLS), dtype=np.uint8)
+    status[:, STATUS_COL] = MAX
+    add("status column",
+        f"one full vertical line of {ROWS} LEDs down the RIGHT edge - the status lamp", status)
+
+    # Asymmetric under every flip and rotation, so an orientation fault cannot look correct.
+    diagonal = np.zeros((ROWS, COLS), dtype=np.uint8)
+    for r in range(ROWS):
+        diagonal[r, r] = MAX
+    add("diagonal", "a line from the top-left corner down and to the right", diagonal)
+
+    # The real renderer, fed a clean breath. If everything above is right and this is not,
+    # the fault is in the rendering, not the wiring.
+    renderer = MatrixRenderer()
+    for i in range(int(30 * 20)):
+        t = i / 20
+        renderer.update(MatrixState(t=t, wave_mm=2.2 * np.sin(2 * np.pi * 14 / 60 * t),
+                                    present=True, alarm=False, presence=1.6))
+    add("wave", "a scrolling sine wave, brightest at the right, plus the status lamp",
+        renderer.update(MatrixState(t=30.0, wave_mm=2.2, present=True, alarm=False,
+                                    presence=1.6)))
+
+    return patterns

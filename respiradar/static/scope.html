@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RespiRadar scope</title>
+<!--
+  Everything is inline and there is no CDN: the board that serves this may have no route to
+  the internet, and neither may the phone looking at it. Plain canvas, no chart library.
+-->
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --dim:#8b949e;
+    --accent:#58a6ff; --good:#3fb950; --warn:#d29922; --bad:#f85149;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  header{
+    position:sticky; top:0; z-index:2; background:var(--bg);
+    border-bottom:1px solid var(--line); padding:12px 16px;
+  }
+  .row{display:flex; flex-wrap:wrap; gap:20px; align-items:baseline}
+  .stat{display:flex; flex-direction:column; gap:2px}
+  .stat b{font-size:26px; font-weight:600; line-height:1.1}
+  .stat span{font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.06em}
+  #state b{font-size:20px}
+  .grid{
+    display:grid; gap:12px; padding:16px;
+    grid-template-columns:repeat(auto-fit,minmax(320px,1fr));
+  }
+  figure{margin:0; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px}
+  figcaption{font-size:12px; color:var(--dim); margin-bottom:8px}
+  figcaption b{color:var(--fg); font-weight:600}
+  canvas{width:100%; height:150px; display:block}
+  #banner{
+    display:none; padding:8px 16px; background:#3d1d1d; color:var(--bad);
+    border-bottom:1px solid var(--line);
+  }
+  @media (max-width:420px){ .grid{padding:8px; gap:8px} canvas{height:120px} }
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <div class="stat" id="state"><b>connecting</b><span>state</span></div>
+    <div class="stat"><b id="bpm">--</b><span>breaths/min</span></div>
+    <div class="stat"><b id="presence">--</b><span>presence</span></div>
+    <div class="stat"><b id="chest">--</b><span>chest range</span></div>
+    <div class="stat"><b id="amp">--</b><span>amplitude</span></div>
+    <div class="stat"><b id="clock">--</b><span>elapsed</span></div>
+  </div>
+  <div class="row" style="margin-top:6px"><span id="source" style="color:var(--dim)"></span></div>
+</header>
+<div id="banner"></div>
+
+<div class="grid">
+  <figure><figcaption><b>1. Range profile</b> — energy returned per distance. The spike at 0.30 m is the sensor's near field, not a person.</figcaption><canvas id="profile"></canvas></figure>
+  <figure><figcaption><b>2. IQ constellation</b> — the chest's complex return. Breathing sweeps an arc; a hold collapses it to a blob.</figcaption><canvas id="iq"></canvas></figure>
+  <figure><figcaption><b>3. Range-time motion</b> — breathing-band motion at every distance, scrolling. A person is a bright horizontal band.</figcaption><canvas id="heat"></canvas></figure>
+  <figure><figcaption><b>4. Motion per range bin</b> — how the chest bin is chosen. Not the brightest bin, the one that <i>moves</i> most.</figcaption><canvas id="bins"></canvas></figure>
+  <figure><figcaption><b>5. Phase → displacement</b> — millimetres, before cleaning. Real breathing is buried under much larger drift.</figcaption><canvas id="raw"></canvas></figure>
+  <figure><figcaption><b>6. The breathing wave</b> — band-passed to 0.18–0.55 Hz. Individual breaths become countable.</figcaption><canvas id="wave"></canvas></figure>
+  <figure><figcaption><b>7. Spectrum</b> — where the energy sits across the breathing band, peak marked.</figcaption><canvas id="spec"></canvas></figure>
+  <figure><figcaption><b>8. Detector</b> — red is an alarm, green is a labelled breath hold. The gap between them is the latency.</figcaption><canvas id="det"></canvas></figure>
+</div>
+
+<script>
+const C = {bg:'#0d1117', panel:'#161b22', line:'#30363d', fg:'#e6edf3', dim:'#8b949e',
+           accent:'#58a6ff', good:'#3fb950', warn:'#d29922', bad:'#f85149'};
+
+/* Canvases are sized in CSS pixels but drawn in device pixels, or everything is blurry
+   on a phone. Re-measured on resize and on orientation change. */
+function fit(cv){
+  const r = window.devicePixelRatio || 1, b = cv.getBoundingClientRect();
+  if (cv.width !== Math.round(b.width*r) || cv.height !== Math.round(b.height*r)){
+    cv.width = Math.round(b.width*r); cv.height = Math.round(b.height*r);
+  }
+  const g = cv.getContext('2d');
+  g.setTransform(r,0,0,r,0,0);
+  return {g, w:b.width, h:b.height};
+}
+function clear(cv){
+  const {g,w,h} = fit(cv);
+  g.clearRect(0,0,w,h);
+  return {g,w,h};
+}
+function axes(g,w,h,pad){
+  g.strokeStyle = C.line; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(pad,h-pad); g.lineTo(w-2,h-pad); g.stroke();
+}
+function label(g,text,x,y,color){
+  g.fillStyle = color||C.dim; g.font = '10px ui-monospace,monospace'; g.fillText(text,x,y);
+}
+/* A line plot over a fixed y-range. Returns the range it used. */
+function plot(cv, ys, color, opts){
+  opts = opts||{};
+  const {g,w,h} = clear(cv);
+  if(!ys || ys.length < 2){ label(g,'waiting…',8,16); return; }
+  const pad = 14;
+  let lo = opts.lo, hi = opts.hi;
+  if(lo === undefined){
+    lo = Math.min(...ys); hi = Math.max(...ys);
+    const span = (hi-lo) || 1; lo -= span*0.08; hi += span*0.08;
+  }
+  if(opts.shade) opts.shade(g,w,h,pad,ys.length);
+  if(opts.zero){
+    const zy = h-pad-((0-lo)/(hi-lo))*(h-2*pad);
+    g.strokeStyle = C.line; g.setLineDash([3,3]);
+    g.beginPath(); g.moveTo(pad,zy); g.lineTo(w-2,zy); g.stroke(); g.setLineDash([]);
+  }
+  g.strokeStyle = color; g.lineWidth = 1.6; g.beginPath();
+  for(let i=0;i<ys.length;i++){
+    const x = pad + (i/(ys.length-1))*(w-pad-2);
+    const y = h-pad-((ys[i]-lo)/(hi-lo))*(h-2*pad);
+    i ? g.lineTo(x,y) : g.moveTo(x,y);
+  }
+  g.stroke();
+  axes(g,w,h,pad);
+  if(opts.unit) label(g,opts.unit,2,10);
+  return {lo,hi};
+}
+/* Vertical bars over a distance axis, one bar per range bin. */
+function bars(cv, values, dists, highlight, color){
+  const {g,w,h} = clear(cv);
+  if(!values || !values.length){ label(g,'waiting…',8,16); return; }
+  const pad = 14, n = values.length, max = Math.max(...values) || 1;
+  const bw = (w-pad-2)/n;
+  for(let i=0;i<n;i++){
+    const bh = (values[i]/max)*(h-2*pad);
+    g.fillStyle = (i===highlight) ? C.good : color;
+    g.fillRect(pad+i*bw+0.5, h-pad-bh, Math.max(1,bw-1.5), bh);
+  }
+  axes(g,w,h,pad);
+  if(dists && dists.length){
+    label(g, dists[0].toFixed(2)+' m', pad, h-3);
+    label(g, dists[dists.length-1].toFixed(2)+' m', w-48, h-3);
+  }
+  if(highlight!=null && dists) label(g,'chest '+dists[highlight].toFixed(2)+' m',pad,10,C.good);
+}
+
+/* Panel 3 keeps its own history: the server sends one new column per tick, because
+   resending a 21 x 256 image five times a second would dwarf everything else on the wire. */
+const heatW = 260, heat = document.createElement('canvas');
+heat.width = heatW; heat.height = 21;
+const heatG = heat.getContext('2d');
+function pushHeat(col){
+  if(heat.height !== col.length){ heat.height = col.length; }
+  heatG.drawImage(heat, -1, 0);            // scroll left by one column
+  const max = Math.max(...col) || 1;
+  for(let i=0;i<col.length;i++){
+    const v = Math.min(1, col[i]/max);
+    // dark navy -> accent blue -> white, so a weak band is still visible
+    const r = Math.round(20 + 235*Math.pow(v,2.2));
+    const gg = Math.round(28 + 200*Math.pow(v,1.5));
+    const b = Math.round(40 + 215*Math.pow(v,0.8));
+    heatG.fillStyle = `rgb(${r},${gg},${b})`;
+    heatG.fillRect(heatW-1, i, 1, 1);
+  }
+}
+function drawHeat(cv, dists){
+  const {g,w,h} = clear(cv);
+  g.imageSmoothingEnabled = false;
+  g.drawImage(heat, 0, 0, w, h);
+  if(dists && dists.length){
+    label(g, dists[0].toFixed(2)+' m', 3, 11, '#c9d1d9');
+    label(g, dists[dists.length-1].toFixed(2)+' m', 3, h-4, '#c9d1d9');
+  }
+}
+
+function drawIQ(cv, pts){
+  const {g,w,h} = clear(cv);
+  if(!pts || pts.length < 2){ label(g,'waiting…',8,16); return; }
+  let cx=0, cy=0;
+  for(const [a,b] of pts){ cx+=a; cy+=b; }
+  cx/=pts.length; cy/=pts.length;
+  let rad = 1;
+  for(const [a,b] of pts) rad = Math.max(rad, Math.hypot(a-cx,b-cy));
+  const s = (Math.min(w,h)/2 - 10)/rad;
+  for(let i=0;i<pts.length;i++){
+    const age = i/(pts.length-1);
+    g.fillStyle = `rgba(88,166,255,${0.15+0.85*age})`;
+    const x = w/2 + (pts[i][0]-cx)*s, y = h/2 - (pts[i][1]-cy)*s;
+    g.beginPath(); g.arc(x,y, i===pts.length-1 ? 3.5 : 1.6, 0, 6.2832); g.fill();
+  }
+  label(g, 'spread '+rad.toFixed(0), 4, 11);
+}
+
+function drawSpectrum(cv, spec){
+  const {g,w,h} = clear(cv);
+  if(!spec || !spec.f || spec.f.length < 2){ label(g,'waiting…',8,16); return; }
+  const pad = 14, f = spec.f, p = spec.p;
+  const f0 = f[0], f1 = f[f.length-1];
+  g.beginPath();
+  for(let i=0;i<f.length;i++){
+    const x = pad + ((f[i]-f0)/(f1-f0))*(w-pad-2);
+    const y = h-pad-p[i]*(h-2*pad);
+    i ? g.lineTo(x,y) : g.moveTo(x,y);
+  }
+  g.lineTo(w-2,h-pad); g.lineTo(pad,h-pad); g.closePath();
+  g.fillStyle = 'rgba(88,166,255,0.22)'; g.fill();
+  g.strokeStyle = C.accent; g.lineWidth = 1.4; g.stroke();
+  if(spec.peak_hz){
+    const x = pad + ((spec.peak_hz-f0)/(f1-f0))*(w-pad-2);
+    g.strokeStyle = C.good; g.setLineDash([4,3]);
+    g.beginPath(); g.moveTo(x,4); g.lineTo(x,h-pad); g.stroke(); g.setLineDash([]);
+    label(g,(spec.peak_hz*60).toFixed(1)+' bpm', Math.min(x+4,w-60), 12, C.good);
+  }
+  axes(g,w,h,pad);
+  label(g,f0.toFixed(2)+' Hz',pad,h-3); label(g,f1.toFixed(2)+' Hz',w-52,h-3);
+}
+
+/* Shading helpers for panels 6 and 8: alarms in red, labelled holds in green. */
+function shadeRuns(g,w,h,pad,n,flags,color){
+  g.fillStyle = color;
+  let start = -1;
+  for(let i=0;i<=n;i++){
+    const on = i<n && flags[i];
+    if(on && start<0) start = i;
+    if(!on && start>=0){
+      const x0 = pad + (start/(n-1))*(w-pad-2), x1 = pad + ((i-1)/(n-1))*(w-pad-2);
+      g.fillRect(x0, 2, Math.max(2,x1-x0), h-pad-2);
+      start = -1;
+    }
+  }
+}
+
+const el = id => document.getElementById(id);
+let lastMessage = 0;
+
+function render(d){
+  if(!d || !d.series){
+    el('state').firstElementChild.textContent = d && d.status ? d.status : 'waiting';
+    return;
+  }
+  const s = d.series;
+  const stateColors = {'APNEA':C.bad,'breathing':C.good,'no presence':C.dim,
+                       'settling':C.warn,'no breathing signal':C.dim};
+  const sb = el('state').firstElementChild;
+  sb.textContent = d.state; sb.style.color = stateColors[d.state] || C.fg;
+  el('bpm').textContent = d.bpm == null ? '--' : d.bpm.toFixed(1);
+  el('bpm').style.color = d.bpm == null ? C.dim : C.fg;
+  el('presence').textContent = d.present ? 'person' : 'nobody';
+  el('presence').style.color = d.present ? C.good : C.dim;
+  el('chest').textContent = d.chest_m.toFixed(2)+' m';
+  el('amp').textContent = d.amp_mm.toFixed(2)+' mm';
+  el('clock').textContent = d.t.toFixed(0)+' s';
+  el('source').textContent = d.source + ' · ' + d.status;
+
+  bars(el('profile'), d.profile, d.distances_m, d.chest_bin, '#2b4a6f');
+  drawIQ(el('iq'), d.iq);
+  pushHeat(d.bin_motion); drawHeat(el('heat'), d.distances_m);
+  bars(el('bins'), d.bin_motion, d.distances_m, d.chest_bin, '#2b4a6f');
+  plot(el('raw'), s.raw, C.dim, {unit:'mm, unfiltered'});
+  plot(el('wave'), s.wave, C.accent, {zero:true, unit:'mm, 0.18–0.55 Hz',
+    shade:(g,w,h,pad,n)=>shadeRuns(g,w,h,pad,n,s.alarm,'rgba(248,81,73,0.16)')});
+  drawSpectrum(el('spec'), d.spectrum);
+
+  // Panel 8: the alarm as a step trace, with any labelled holds behind it.
+  const holdFlags = s.t.map(t => (d.holds||[]).some(([a,b]) => t>=a && t<b));
+  plot(el('det'), s.alarm, C.bad, {lo:-0.15, hi:1.15, unit:'alarm',
+    shade:(g,w,h,pad,n)=>shadeRuns(g,w,h,pad,n,holdFlags,'rgba(63,185,80,0.20)')});
+}
+
+function connect(){
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onmessage = e => { lastMessage = Date.now(); el('banner').style.display='none';
+                        try{ render(JSON.parse(e.data)); }catch(err){ console.error(err); } };
+  // Reconnect rather than die: a phone that sleeps, or wifi that drops, should recover
+  // without anyone touching the board.
+  ws.onclose = () => { banner('disconnected — retrying'); setTimeout(connect, 1500); };
+  ws.onerror = () => ws.close();
+}
+function banner(text){ const b = el('banner'); b.textContent = text; b.style.display='block'; }
+setInterval(() => { if(lastMessage && Date.now()-lastMessage > 4000) banner('no data for 4 s'); }, 1000);
+addEventListener('resize', () => {});
+connect();
+</script>
+</body>
+</html>

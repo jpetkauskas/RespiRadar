@@ -18,6 +18,8 @@ Two practical concessions:
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 
 from respiradar.bakeoff import Clip
@@ -114,3 +116,47 @@ class LiveDetector:
         except Exception:
             # A detector that cannot run live must not take the dashboard down with it.
             return self.alarm
+
+
+class AlarmWorker:
+    """Runs the detector on its own thread, so a slow verdict never stalls the display.
+
+    The detectors are written against a whole `Clip` and re-run from scratch over the live
+    buffer, which costs O(n). Measured on this corpus: 49 ms over a 30 s buffer, 373 ms over
+    60 s, 1.9 s over the 300 s `live.BUFFER_S` default - against a 0.5 s cadence, on a laptop.
+    The UNO Q's A53s are several times slower again, so evaluating inline would drop the frame
+    rate to whatever the detector managed, and a frozen matrix is worse than a late alarm.
+
+    So: the frame loop only extracts features (0.63 ms/frame) and draws, and this thread loops
+    over the buffer as fast as it can, publishing a single bool. An apnea alarm has ~20 s of
+    latency by nature - a verdict that is a couple of seconds stale changes nothing, and the
+    wave stays at full frame rate, which is the part a person actually watches.
+    """
+
+    def __init__(self, live: LiveDetector) -> None:
+        self.live = live
+        self.alarm = False
+        self.lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            with self.lock:
+                snapshot = (list(self.live.times), list(self.live.rows))
+            if len(snapshot[0]) <= 40:
+                self._stop.wait(0.2)
+                continue
+            try:
+                # Outside the lock: this is the expensive part, and the frame loop must not
+                # wait on it.
+                self.alarm = bool(self.live.evaluate(snapshot))
+            except Exception:
+                # A detector that cannot run live must not take the display down with it.
+                # Keep the last verdict and try again.
+                pass
+            self._stop.wait(0.1)
+
+    def stop(self) -> None:
+        self._stop.set()

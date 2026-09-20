@@ -206,3 +206,33 @@ def test_the_wave_never_writes_into_the_status_column():
     frame = _drive(renderer, _breathing(amplitude=20.0), 30, present=True, alarm=False,
                    presence=0.8)
     assert not frame[:, STATUS_COL].any()
+
+
+# -- the self-test patterns ---------------------------------------------
+
+
+def test_the_self_test_patterns_are_valid_frames():
+    """These go to the board before anything else does, so they must not be the thing that
+    is broken."""
+    from respiradar.ledmatrix import test_patterns
+
+    patterns = test_patterns()
+    assert len(patterns) >= 6
+    for name, expect, frame in patterns:
+        assert frame.shape == (ROWS, COLS), name
+        assert frame.dtype == np.uint8, name
+        assert frame.max() <= MAX, name
+        assert expect and isinstance(expect, str), name
+
+
+def test_the_orientation_patterns_are_not_symmetric():
+    """A pattern that survives a flip or a transpose cannot detect one."""
+    from respiradar.ledmatrix import test_patterns
+
+    by_name = {name: frame for name, _, frame in test_patterns()}
+    for name in ("corner", "diagonal", "ramp"):
+        frame = by_name[name]
+        assert not np.array_equal(frame, np.fliplr(frame)), f"{name} survives a horizontal flip"
+    corner = by_name["corner"]
+    assert not np.array_equal(corner, np.flipud(corner))
+    assert corner[0, 0] == MAX and np.count_nonzero(corner) == 1
