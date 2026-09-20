@@ -442,9 +442,16 @@ class Scope(QtWidgets.QMainWindow):
             fr = np.fft.rfftfreq(8 * len(seg), 1 / fs) * 60
             band = (fr >= BAND[0] * 60) & (fr <= BAND[1] * 60)
             self.c_spec.setData(fr[band], spec[band])
-            if band.any() and spec[band].max() > 0:
-                bpm = float(fr[band][int(np.argmax(spec[band]))])
+            in_band = spec[band]
+            # Noise always has a largest peak, so reporting the argmax unconditionally
+            # invents a breathing rate from an empty room. Require the peak to stand clear
+            # of the rest of the band before believing it is a chest.
+            if band.any() and in_band.max() > 6 * np.median(in_band):
+                bpm = float(fr[band][int(np.argmax(in_band))])
                 self.spec_peak.setPos(bpm)
+                self.spec_peak.show()
+            else:
+                self.spec_peak.hide()
 
         self.c_det.setData(t[lo : i + 1], d["alarms"][lo : i + 1].astype(float))
         self.now_line.setPos(t[i])
@@ -454,9 +461,15 @@ class Scope(QtWidgets.QMainWindow):
         amp = float(np.std(d["wave"][max(0, i - int(4 * fs)) : i + 1])) if i > 10 else 0.0
 
         self.readouts["bpm"].setText("--" if bpm is None else f"{bpm:.1f}")
+        self.readouts["bpm"].setStyleSheet(
+            "font-size:30px; font-weight:600;" if bpm is not None
+            else "font-size:30px; font-weight:600; color:#8b949e;")
         self.readouts["chest"].setText(f"{chest_m:.2f} m")
         self.readouts["amp"].setText(f"{amp:.2f} mm")
-        if alarming:
+        if bpm is None and not alarming:
+            self.readouts["state"].setText("no breathing signal")
+            colour = "#8b949e"
+        elif alarming:
             self.readouts["state"].setText("APNEA")
             colour = BAD
         elif in_hold:
