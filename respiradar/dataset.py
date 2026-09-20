@@ -83,7 +83,7 @@ FEATURE_NAMES = [
     "rms_4s",  # bandpassed chest motion over the last 4 s - the fast apnea signal
     "rms_8s",
     "rms_16s",
-    "baseline",  # slow causal average of rms_8s: this person's own normal
+    "baseline",  # this person's own normal: see REFERENCE MODE in FeatureExtractor
     "ratio_4s",  # rms_4s / baseline - near 0 during a hold, near 1 while breathing
     "ratio_8s",
     "intra",  # presence fast-motion score - high while talking or moving
@@ -92,14 +92,69 @@ FEATURE_NAMES = [
     "disp_std_4s",  # unfiltered motion, including gross movement
     "flatness",  # spectral flatness in band: 1 = noise-like, 0 = one clean tone
     "autocorr",  # strength of the dominant period - breathing is regular, talking is not
+    # --- added with the reference/warmup rework; see the class docstring ---
+    "ref_q25",  # trailing low quantile of rms_8s - a self-reference that cannot ratchet
+    "ratio_4s_q",  # rms_4s / ref_q25
+    "ratio_8s_q",  # rms_8s / ref_q25
+    "ref_ratchet",  # the OLD asymmetric-EMA baseline, kept for comparison
+    "seconds_of_history",  # how long this extractor has been running, in seconds
+    "warm",  # 0 while the features are provisional, ramping to 1 once they are settled
 ]
 
 
+MIN_RMS_S = 2.0  # shortest window we are willing to call an RMS
+MIN_SPECTRUM_S = 6.0  # shortest window we are willing to take a spectrum of
+WARM_S = 16.0  # history at which the features are considered fully settled
+SEED_BASELINE_S = 4.0  # history at which a provisional self-reference is seeded
+INIT_FILTER_STATE = True  # start the band-pass settled at the first sample, not at zero
+
+
 class FeatureExtractor:
-    """Turns frames into the feature row used by every detector in the bake-off."""
+    """Turns frames into the feature row used by every detector in the bake-off.
 
+    REFERENCE MODE. Every useful apnea statistic is *this* chest's motion against *this*
+    chest's normal, so the self-reference is the most load-bearing thing in here.
 
-    def __init__(self, config: RadarConfig, baseline_time_const_s: float = 45.0) -> None:
+    The original reference was an asymmetric EMA that rose fast and fell ~40x slower, so a
+    long hold could not drag "normal" down to meet itself. The side effect was worse than the
+    problem: it ratcheted up to the subject's *best* breathing and stayed there, so after one
+    burst of movement ordinary shallow breathing read as apnea for minutes. Two bake-off
+    entries diagnosed this independently and both worked around it privately, and one measured
+    justinas-sleeping-2 sitting at a baseline of 2.28 against an actual rms_4s of 1.2.
+
+    The fix is a TRAILING LOW QUANTILE: the 25th percentile of rms_8s over the last
+    `ref_window_s`, computed causally with a zero-order hold (`method="lower"`, never an
+    interpolation onto a value the window does not contain). A quantile cannot ratchet - it
+    forgets - and a quarter of a two-minute window is still normal breathing for the first
+    ~30 s of any hold we have labelled.
+
+    The quantile is ADDED rather than swapped in: `ref_q25`, `ratio_4s_q` and `ratio_8s_q`
+    are the non-ratcheting reference and are what new work should use, while `baseline` /
+    `ratio_4s` / `ratio_8s` keep the meaning every existing detector was tuned against. That
+    is not timidity. The two references answer different questions, and `changepoint` uses
+    both deliberately: a trailing quantile for its slow channel, and the ratchet for its
+    fastest one *because* a reference that refuses to follow a hold downwards is exactly what
+    a fast channel wants. Measured, swapping the meaning of `baseline` for the quantile takes
+    `baseline/energy-threshold` from 16 false alarms to 0 and `temporal` from 9 to 5, and
+    costs the leading `cusum-bank-conservative` a hold (3/4 -> 2/4) and 8 s of worst-case
+    latency. `reference="quantile"` makes the swap for anyone who wants to measure it again.
+
+    WARMUP. Two of the four labelled holds start before 16 s. The extractor used to report
+    a literal 0.0 for any RMS whose window was not yet full, which reads as a perfect breath
+    hold, and it refused to form a reference at all until 16 s. Now every window is computed
+    over whatever history exists past a short minimum, the reference is seeded at
+    `SEED_BASELINE_S`, and `warm` / `seconds_of_history` say how provisional the row is so a
+    detector can reason about its own reliability instead of guessing.
+    """
+
+    def __init__(
+        self,
+        config: RadarConfig,
+        baseline_time_const_s: float = 45.0,
+        ref_window_s: float = 120.0,
+        ref_quantile: float = 0.25,
+        reference: str = "ratchet",  # "ratchet" | "quantile" | "min"
+    ) -> None:
         self.config = config
         self.fs = config.frame_rate
         self.presence = PresenceDetector(config)
@@ -119,13 +174,13 @@ class FeatureExtractor:
         self.sos = signal.butter(
             2, [LOW_HZ / nyquist, HIGH_HZ / nyquist], btype="bandpass", output="sos"
         )
-        self.zi = signal.sosfilt_zi(self.sos) * 0.0
+        # Filled on the first frame from sosfilt_zi scaled by the first displacement, so the
+        # filter starts in the steady state for that DC level instead of stepping into it.
+        self.zi = None
+        self.zi_unit = signal.sosfilt_zi(self.sos)
 
         self.buffer_len = int(16 * self.fs)
-        # The band-pass rings for several seconds after it starts. Until the buffer is full
-        # those samples are a filter transient, not chest motion, and must not seed the
-        # baseline - doing so latches it to a near-zero value and makes every ratio explode.
-        self.warm = False
+        self.n_frames = 0
         self.filtered: list[float] = []
         self.raw: list[float] = []
 
@@ -135,18 +190,34 @@ class FeatureExtractor:
         self.baseline: float | None = None
         self.baseline_alpha = 1 / (baseline_time_const_s * self.fs)
 
+        self.reference_mode = reference
+        self.ref_quantile = ref_quantile
+        self.ref_window = max(int(ref_window_s * self.fs), 1)
+        self.rms8_hist: list[float] = []  # trailing rms_8s, for the quantile reference
+
+    @property
+    def seconds_of_history(self) -> float:
+        return self.n_frames / self.fs
+
     def _window_rms(self, seconds: float) -> float:
+        """RMS over the last `seconds`, or over whatever history exists past MIN_RMS_S.
+
+        Returning 0.0 while the window fills - what this used to do - is not "no data", it is
+        the exact value a perfect breath hold produces, and it lasted 16 s on a 16 s window.
+        """
         n = int(seconds * self.fs)
-        if len(self.filtered) < n:
+        have = len(self.filtered)
+        if have < int(MIN_RMS_S * self.fs):
             return 0.0
-        x = np.asarray(self.filtered[-n:])
+        x = np.asarray(self.filtered[-min(n, have) :])
         return float(np.sqrt(np.mean(x**2)))
 
     def _flatness_and_autocorr(self) -> tuple[float, float]:
         n = int(16 * self.fs)
-        if len(self.filtered) < n:
+        have = len(self.filtered)
+        if have < int(MIN_SPECTRUM_S * self.fs):
             return 1.0, 0.0
-        x = np.asarray(self.filtered[-n:])
+        x = np.asarray(self.filtered[-min(n, have) :])
         x = x - x.mean()
         if np.allclose(x, 0):
             return 1.0, 0.0
@@ -221,6 +292,11 @@ class FeatureExtractor:
         # when breathing stops the selector goes hunting for whatever else is moving, so an
         # apnea can never be observed - it simply re-points at a different bin. A 90 s time
         # constant is dominated by normal breathing and barely moves during a 30 s hold.
+        #
+        # Bias-correcting this EMA's start-up (alpha = max(1/(90 fs), 1/n), which would make
+        # it an exact running mean until the window is worth 90 s) was tried and REJECTED: it
+        # won cusum-bank-conservative a fourth hold and cost it two false alarms, and false
+        # alarms come first. The selector's start-up is left alone.
         if self.bin_slow is None:
             self.bin_slow = motion_mm
         else:
@@ -266,6 +342,13 @@ class FeatureExtractor:
         displacement = float(np.sum(self.unwrapped * weights)) * MM_PER_RADIAN
 
         # Causal band-pass: sosfilt, never sosfiltfilt, which would look into the future.
+        # Starting from zero state means the first displacement arrives as a step and the
+        # filter rings its way out of it for several seconds - which is most of the history
+        # a hold starting at 4.6 s ever gets. sosfilt_zi is the state that holds a constant
+        # input steady, so scaling it by the first sample starts the filter already settled
+        # at that DC level and leaves only genuine motion to respond to.
+        if self.zi is None:
+            self.zi = self.zi_unit * (displacement if INIT_FILTER_STATE else 0.0)
         value, self.zi = signal.sosfilt(self.sos, [displacement], zi=self.zi)
         self.filtered.append(float(value[0]))
         self.raw.append(displacement)
@@ -277,11 +360,17 @@ class FeatureExtractor:
         rms_8 = self._window_rms(8.0)
         rms_16 = self._window_rms(16.0)
 
-        # The baseline learns what this person's normal breathing looks like. It only rises
-        # quickly, never falls quickly, so a long hold cannot quietly drag "normal" down to
-        # match itself.
-        self.warm = self.warm or len(self.filtered) >= self.buffer_len
-        if self.warm and rms_8 > 0:
+        self.n_frames += 1
+        history_s = self.seconds_of_history
+        # A ramp, not a flag: the row is provisional from the moment there is any history and
+        # fully trustworthy once the 16 s windows are full. Consumers that want the old
+        # boolean can test `warm >= 1`.
+        warm = float(np.clip(history_s / WARM_S, 0.0, 1.0))
+        seeded = history_s >= SEED_BASELINE_S and rms_8 > 0
+
+        # The old reference: rises fast, falls ~40x slower. Kept for comparison only - it
+        # ratchets to this subject's best breathing and never comes back down.
+        if seeded:
             if self.baseline is None:
                 self.baseline = rms_8
             elif rms_8 > self.baseline:
@@ -291,18 +380,45 @@ class FeatureExtractor:
                 a = self.baseline_alpha * 0.1  # and down only very slowly
                 self.baseline = (1 - a) * self.baseline + a * rms_8
 
-        # Before a baseline exists we do not know what this person's normal looks like, so
+        # The trailing low quantile. Strictly past frames, and `method="lower"` returns a
+        # value the window actually contains - never an interpolation towards a neighbour,
+        # which at the top of the window would be a sample that has not happened yet.
+        if rms_8 > 0:
+            self.rms8_hist.append(rms_8)
+            if len(self.rms8_hist) > self.ref_window:
+                self.rms8_hist.pop(0)
+        if seeded and self.rms8_hist:
+            ref_q = float(np.quantile(self.rms8_hist, self.ref_quantile, method="lower"))
+        else:
+            ref_q = 0.0
+
+        ratchet = self.baseline if self.baseline and self.baseline > 0 else 0.0
+        if self.reference_mode == "ratchet":
+            base = ratchet
+        elif self.reference_mode == "quantile":
+            base = ref_q
+        else:  # "min": the quantile stops the ratcheting, the EMA caps the quantile
+            candidates = [v for v in (ratchet, ref_q) if v > 0]
+            base = min(candidates) if candidates else 0.0
+
+        # Before a reference exists we do not know what this person's normal looks like, so
         # report a neutral ratio of 1.0 ("looks normal") rather than 0.0, which would read as
         # a breath hold and alarm during every start-up.
-        if self.baseline is None or self.baseline <= 0:
+        # Clamp: a ratio of 10 and a ratio of 10,000 mean the same thing (moving a lot),
+        # and the unclamped value wrecks any model that scales its inputs.
+        if base <= 0:
             base = float(rms_8) if rms_8 > 0 else 1.0
             ratio_4 = ratio_8 = 1.0
         else:
-            base = self.baseline
-            # Clamp: a ratio of 10 and a ratio of 10,000 mean the same thing (moving a lot),
-            # and the unclamped value wrecks any model that scales its inputs.
             ratio_4 = min(rms_4 / base, 10.0)
             ratio_8 = min(rms_8 / base, 10.0)
+
+        if ref_q > 0:
+            ratio_4_q = min(rms_4 / ref_q, 10.0)
+            ratio_8_q = min(rms_8 / ref_q, 10.0)
+        else:
+            ref_q = float(rms_8) if rms_8 > 0 else 1.0
+            ratio_4_q = ratio_8_q = 1.0
 
         n4 = int(4 * self.fs)
         disp_std = float(np.std(self.raw[-n4:])) if len(self.raw) >= n4 else 0.0
@@ -322,6 +438,12 @@ class FeatureExtractor:
                 disp_std,
                 flatness,
                 autocorr,
+                ref_q,
+                ratio_4_q,
+                ratio_8_q,
+                ratchet if ratchet > 0 else base,
+                history_s,
+                warm,
             ],
             dtype=float,
         )

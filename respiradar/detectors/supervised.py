@@ -103,6 +103,22 @@ def _time_since_above(x: np.ndarray, level: float, cap_s: float = SILENCE_CAP_S)
     return np.minimum((idx - last) / FS, cap_s)
 
 
+def _down_cusum(z: np.ndarray, drift: float, cap: float = 60.0) -> np.ndarray:
+    """One-sided CUSUM accumulating evidence that `z` has shifted downwards.
+
+    S[i] = clip(S[i-1] - (z[i] + drift), 0, cap). It rises only while z sits more than
+    `drift` below zero, and decays as soon as the signal comes back, so it measures the
+    depth-times-duration of a drop rather than its instantaneous depth. Causal by shape.
+    """
+    n = len(z)
+    out = np.empty(n)
+    s = 0.0
+    for i in range(n):
+        s = min(max(s - (z[i] + drift), 0.0), cap)
+        out[i] = s
+    return out
+
+
 def _causal_quantile(
     x: np.ndarray, window_s: float, q: float, valid: np.ndarray | None = None, decim: int = 10
 ) -> np.ndarray:
@@ -236,6 +252,18 @@ def augment(X: np.ndarray) -> np.ndarray:
     for w in (10.0, 30.0):
         cols.append(_causal_min(flat, int(w * FS)))
 
+    # One-sided CUSUM charts on the log energy against the subject's own running median.
+    # A level feature answers "is it quiet now"; a CUSUM answers "how much evidence has piled
+    # up that it went quiet and stayed there", which is the statistic the hand-built
+    # change-point detectors in this bake-off win on. Several drift terms give the classifier
+    # a fast-but-twitchy chart and a slow-but-sure one to combine.
+    z = np.log(np.maximum(rms4, 1e-6)) - np.log(ref50)
+    for drift in (0.15, 0.35, 0.70):
+        cols.append(_down_cusum(z, drift))
+    z8 = np.log(np.maximum(rms8, 1e-6)) - np.log(ref50)
+    for drift in (0.15, 0.35):
+        cols.append(_down_cusum(z8, drift))
+
     # A short-horizon drop detector. The quantile references above need a minute or two of
     # history, which a hold in the first half-minute of a recording does not have; this one
     # only needs its own window, so it is what catches an early hold.
@@ -248,17 +276,17 @@ def augment(X: np.ndarray) -> np.ndarray:
 
 
 class SupervisedApneaDetector:
-    name = "supervised/rf-hysteresis"
+    name = "supervised/hgb-duration"
 
     def __init__(
         self,
-        on_threshold: float = 0.40,
+        on_threshold: float = 0.70,
         off_threshold: float = 0.20,
         smooth_s: float = 1.0,
         min_duration_s: float = 10.0,
         onset_grace_s: float = 6.0,
         recovery_grace_s: float = 6.0,
-        model: str = "rf",
+        model: str = "hgb",
         class_weight: float = 5.0,
         name: str | None = None,
     ) -> None:
@@ -283,12 +311,17 @@ class SupervisedApneaDetector:
 
         if self.model_kind == "hgb":
             return HistGradientBoostingClassifier(
-                max_depth=3,
-                max_iter=150,
-                learning_rate=0.08,
-                min_samples_leaf=40,
+                max_depth=5,
+                max_iter=100,
+                learning_rate=0.05,
+                min_samples_leaf=20,
                 l2_regularization=1.0,
                 random_state=0,
+                # Off deliberately: sklearn turns early stopping on above 10k rows, which
+                # carves out a random validation split and makes the fitted model depend on
+                # the seed. With four labelled events in the whole dataset, a scoring
+                # difference that comes from a seed is noise being mistaken for tuning.
+                early_stopping=False,
             )
         if self.model_kind == "rf":
             return RandomForestClassifier(

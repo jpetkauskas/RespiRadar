@@ -56,3 +56,29 @@ def test_the_gate_costs_nothing_on_real_recordings():
 
     assert gated.detected == plain.detected
     assert gated.false_alarms == plain.false_alarms
+
+
+def test_the_best_detector_catches_every_hold_without_false_alarms():
+    """The demo candidate: 4/4 holds, zero false alarms, leave-one-subject-out."""
+    from respiradar.bakeoff import score
+    from respiradar.detectors.gated import build_best
+
+    result = score(build_best())
+
+    assert result.detected == 4
+    assert result.missed == 0
+    assert result.false_alarms == 0
+
+
+def test_the_best_detector_also_stays_quiet_in_an_empty_room():
+    clip = _empty_room_clip()
+    detector = build_best_detector()
+    detector.fit(folds()[0][0])
+
+    assert not detector.predict(clip)[clip.t >= 25].any()
+
+
+def build_best_detector():
+    from respiradar.detectors.gated import build_best
+
+    return build_best()
