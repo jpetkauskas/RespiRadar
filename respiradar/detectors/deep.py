@@ -267,9 +267,28 @@ def feat_stream(X: np.ndarray) -> np.ndarray:
     return np.concatenate([a, b], axis=1)
 
 
+def shape_stream(name: str) -> np.ndarray:
+    """The same spectrogram with the LEVEL DIVIDED OUT: each column normalised by its own
+    band energy, so only the shape of the spectrum survives.
+
+    This is the direct test of the premise that a learned model could find rhythmicity
+    rather than amplitude. A still-breathing person and an apneic person have the same
+    level; if any separation survives this normalisation, it is separation no energy
+    detector can reach."""
+    S = spectrogram_for(name).astype(float)
+    nf = S.shape[1] // 2
+    out = np.empty_like(S)
+    for lo in (0, nf):
+        block = S[:, lo : lo + nf]
+        out[:, lo : lo + nf] = block / np.maximum(block.sum(axis=1, keepdims=True), 1e-12)
+    return out * nf
+
+
 def channels_for(clip: Clip, mode: str) -> np.ndarray:
     name = clip.name.split("[")[0]
     parts = []
+    if mode == "shape":
+        parts.append(shape_stream(name))
     if mode in ("spec", "both"):
         S = spec_stream(name)
         if len(S) != len(clip.t):  # a sliced clip: align by index from the session start
@@ -349,6 +368,7 @@ class DeepApneaDetector:
         dropout: float = 0.3,
         noise: float = 0.15,
         event_weighted: bool = False,
+        auto_threshold: bool = False,
         seed: int = SEED,
     ) -> None:
         self.mode = mode
@@ -364,6 +384,7 @@ class DeepApneaDetector:
         self.dropout = dropout
         self.noise = noise
         self.event_weighted = event_weighted
+        self.auto_threshold = auto_threshold
         self.seed = seed
         self.nets: list = []
         self.net = None
@@ -423,7 +444,8 @@ class DeepApneaDetector:
         else:
             wt = torch.ones(len(xt))
         n = len(xt)
-        self.nf = 2 * SpectrogramExtractor().n_freq if self.mode in ("spec", "both") else 0
+        self.nf = (2 * SpectrogramExtractor().n_freq
+                   if self.mode in ("spec", "both", "shape") else 0)
         self.nets = []
         losses = [0.0]
         for member in range(self.n_models):
@@ -440,12 +462,39 @@ class DeepApneaDetector:
         self.net = self.nets[0]
 
         p = self.probabilities_from(xt)
+        if self.auto_threshold:
+            self._calibrate(clips)
         self.train_report = {
+            "on_threshold": round(self.on_threshold, 4),
             "n_train": int(n),
             "final_loss": round(losses[-1], 4),
             "train_auc": round(_auc(y, p), 4),
             "clips": [c.name for c in clips],
         }
+
+    def _calibrate(self, clips: Sequence[Clip]) -> None:
+        """Set the alarm threshold from the TRAINING clips' negatives only.
+
+        Sweeping the threshold against the held-out folds would be tuning on the test set,
+        which is the specific dishonesty this whole protocol exists to prevent. Instead the
+        threshold is the level the training negatives essentially never sustain: the 99.9th
+        percentile of the smoothed probability over training frames that are outside every
+        labelled hold, floored at 0.5 so a well-separated fit cannot produce a reckless one.
+
+        It is still optimistic - the training negatives are ones the model has seen - and the
+        measured consequence is in the assessment at the bottom of this file.
+        """
+        vals = []
+        for clip in clips:
+            p = self._smooth(self.probabilities(clip))
+            keep = (clip.t >= 25.0) & ~clip.y
+            if keep.any():
+                vals.append(p[keep])
+        if not vals:
+            return
+        q = float(np.percentile(np.concatenate(vals), 99.9))
+        self.on_threshold = float(np.clip(max(q, 0.5), 0.5, 0.99))
+        self.off_threshold = self.on_threshold * 0.5
 
     def _train_one(self, net, opt, g, xt, yt, wt, loss_fn, n):
         import torch
@@ -492,14 +541,17 @@ class DeepApneaDetector:
         X = ((patches(stream, idx) - self.centre) / self.scale).astype(np.float32)
         return self.probabilities_from(torch.from_numpy(X))
 
-    def predict(self, clip: Clip) -> np.ndarray:
-        p = self.probabilities(clip)
-        # Trailing 1 s smoother, causal.
-        k = int(1.0 * FS)
+    @staticmethod
+    def _smooth(p: np.ndarray, seconds: float = 1.0) -> np.ndarray:
+        k = int(seconds * FS)
         csum = np.concatenate([[0.0], np.cumsum(p)])
-        lo = np.maximum(np.arange(len(p)) - k + 1, 0)
-        smooth = (csum[np.arange(len(p)) + 1] - csum[lo]) / (np.arange(len(p)) + 1 - lo)
+        i = np.arange(len(p))
+        lo = np.maximum(i - k + 1, 0)
+        return (csum[i + 1] - csum[lo]) / (i + 1 - lo)
 
+    def predict(self, clip: Clip) -> np.ndarray:
+        smooth = self._smooth(self.probabilities(clip))
+        p = smooth
         need = int(self.min_duration_s * FS)
         alarms = np.zeros(len(p), dtype=bool)
         latched = False
@@ -528,23 +580,190 @@ def _auc(y: np.ndarray, p: np.ndarray) -> float:
     return float((ranks[y].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
 
 
+REGULARISED = dict(
+    epochs=12, width=8, n_models=5, dropout=0.5, noise=0.3,
+    event_weighted=True, auto_threshold=True, min_duration_s=8.0,
+)
+
+
 def build():
-    """The entry the bake-off scores: CNN over spectrogram + shared features, presence-gated."""
+    """The entry the bake-off scores.
+
+    Spectrogram only. Adding the 18 shared features to the same network is measurably
+    WORSE, not better: held-out AUC falls from 0.74-0.91 to 0.43-0.77 while training AUC
+    rises to 0.98, which is the signature of the network identifying the recording from its
+    feature levels rather than learning what a hold looks like.
+    """
     from respiradar.detectors import gated
 
-    return gated.PresenceGatedDetector(inner=DeepApneaDetector(mode="both"),
-                                       name="deep/cnn-gated")
+    return gated.PresenceGatedDetector(
+        inner=DeepApneaDetector(mode="spec", **REGULARISED), name="deep/cnn-spectrogram"
+    )
 
 
-def build_spec():
+def build_shape():
+    """Amplitude removed. See the assessment: this is the experiment, not a candidate."""
     from respiradar.detectors import gated
 
-    return gated.PresenceGatedDetector(inner=DeepApneaDetector(mode="spec"),
-                                       name="deep/cnn-spec")
+    return gated.PresenceGatedDetector(
+        inner=DeepApneaDetector(mode="shape", **REGULARISED), name="deep/cnn-shape-only"
+    )
+
+
+def build_both():
+    from respiradar.detectors import gated
+
+    return gated.PresenceGatedDetector(
+        inner=DeepApneaDetector(mode="both", **REGULARISED), name="deep/cnn-spec+feat"
+    )
 
 
 def build_feat():
     from respiradar.detectors import gated
 
-    return gated.PresenceGatedDetector(inner=DeepApneaDetector(mode="feat"),
-                                       name="deep/cnn-feat")
+    return gated.PresenceGatedDetector(
+        inner=DeepApneaDetector(mode="feat", **REGULARISED), name="deep/cnn-features"
+    )
+
+
+def build_unregularised():
+    """The first thing anyone writes: a bigger net, no event weighting, no ensemble.
+
+    Kept because its numbers are the argument. Training AUC 1.000, held-out AUC 0.52-0.68.
+    """
+    from respiradar.detectors import gated
+
+    return gated.PresenceGatedDetector(
+        inner=DeepApneaDetector(mode="both", epochs=30, width=16, on_threshold=0.90),
+        name="deep/cnn-unregularised",
+    )
+
+
+def _check_prefix(detector=None, name: str = "nishant-holds-3008", k: int = 2000) -> bool:
+    """Prefix replay: predict(clip[:k]) must equal predict(clip)[:k], exactly.
+
+    The property that says this could run on a live sensor. Run it after any change here.
+    """
+    from respiradar.bakeoff import _clip, folds
+
+    detector = detector or build()
+    train, _ = folds()[0]
+    detector.fit(train)
+    full = _clip(name, 0.0, 1e9)
+    short = Clip(full.name, full.t[:k], full.X[:k], full.y[:k],
+                 [h for h in full.holds if h.end_s <= full.t[k - 1]])
+    a_full = detector.predict(full)[:k]
+    a_short = detector.predict(short)
+    ok = bool(np.array_equal(a_full, a_short))
+    print(f"prefix replay {name}[:{k}]: {'OK' if ok else 'MISMATCH'} "
+          f"({int(np.count_nonzero(a_full != a_short))} frames differ)")
+    return ok
+
+
+# =======================================================================================
+# Honest assessment
+# =======================================================================================
+# THE HEADLINE: the deep model loses, and loses badly. Leave-one-subject-out, wall scored:
+#
+#   gated/best (shipped)         12/13 holds, 0 false alarms, worst 23.7 s, median 18.0 s
+#   deep/cnn-spectrogram          2/13 holds, 1 false alarm,  worst 22.5 s, median 17.8 s
+#   deep/cnn-spec+feat            2/13 holds, 0 false alarms, worst  6.1 s
+#   deep/cnn-features             2/13 holds, 0 false alarms, worst  4.6 s
+#   deep/cnn-unregularised        2/13 holds, 5 false alarms
+#
+# Thirteen holds is not a training set for a neural network, and this is what that looks
+# like. Nothing below should be read as a reason to ship any of it.
+#
+# TRAIN VERSUS HELD-OUT, which is the number that actually explains the table. AUC over
+# frames past the 25 s warmup, within each hold session:
+#
+#   config                       train AUC   held-out AUC per hold session
+#   cnn, 18 shared features        0.999     0.29 0.73 0.37 0.53 0.41   <- below chance
+#   cnn, features + spectrogram    1.000     0.55 0.52 0.52 0.68 0.68
+#   cnn, spectrogram only          0.993     0.73 0.77 0.90 0.90 0.86
+#   REGULARISED, spectrogram       0.907     0.79 0.74 0.88 0.87 0.91
+#   REGULARISED, shape only        0.860     0.53 0.53 0.85 0.81 0.92
+#
+# Two things fall out of that table and both are worth more than the bake-off row.
+#
+# 1. THE SHARED FEATURE ROW IS POISON FOR A NETWORK. Given the 18 features the network
+#    reaches training AUC 0.999 and held-out AUC *below chance* on three of five sessions.
+#    It is not failing to learn; it is learning which recording it is looking at. Adding the
+#    features to the spectrogram model drags held-out AUC from 0.74-0.91 down to 0.43-0.77.
+#    Every previous entry that reported "multivariate models lose to a scalar" was seeing
+#    this, and it reproduces here at much greater strength with more capacity.
+#
+# 2. SPECTRAL SHAPE, WITH AMPLITUDE DIVIDED OUT, GENUINELY TRANSFERS. `build_shape()`
+#    normalises every spectrogram column by its own band energy, so the level - the only
+#    thing every shipped detector uses - is gone. It still reaches held-out AUC 0.85, 0.81
+#    and 0.92 on the three scripted sessions. That is the premise the brief asked to
+#    re-test, and on ranking it is TRUE: there is subject-transferable information in the
+#    shape of the breathing-band spectrum that no energy detector can see.
+#
+#    What the network found is not "a rhythmic line is present". Single shape scalars point
+#    the other way: spectral flatness and peakiness are HIGHER inside holds, not lower
+#    (AUC 0.35-0.41 in the expected direction). What is consistent across all five sessions
+#    is that the spectral CENTROID FALLS during a hold (AUC 0.23-0.46, every session on the
+#    same side) and the fraction of band energy above 0.45 Hz falls with it (0.20-0.46):
+#    breathing puts content in the upper half of the band, and what remains when it stops is
+#    slow drift. No single one of those scalars exceeds 0.70; the network's 0.85-0.92 comes
+#    from combining the whole 18-point shape. That is a real thing a learned model found and
+#    a hand-built statistic in this repo has not.
+#
+# WHY IT STILL LOSES. Ranking is not alarming. Converting a held-out AUC of 0.88 into an
+# alarm needs a threshold that means the same thing on a body the model has never seen, and
+# it does not. `_calibrate` sets the threshold from the training negatives alone - the only
+# honest way - and gets 0.965, at which the model fires twice in thirteen holds. Sweeping
+# the threshold against the HELD-OUT folds, which is cheating and is reported here only to
+# bound what better calibration could buy, the same probabilities reach 6/13 at one false
+# alarm and 0/13 at zero. So even with the operating point chosen by an oracle the deep
+# model reaches half of what the shipped change-point bank does honestly.
+#
+# THE REPRESENTATION IS NOT THE PROBLEM. A one-dimensional reduction of the very same
+# spectrogram stream - band RMS of the selected range bin over its own trailing 75th
+# percentile, no learning of any kind - scores 11/13 holds at one false alarm with a fixed
+# threshold. The CNN reading that stream scores 2/13. The stream carries the signal and the
+# network throws it away. This is the cleanest statement of the result available: with 13
+# events, a learned reader of a good representation is worse than a threshold on it.
+#
+# THE QUESTION THE BRIEF ASKED ABOUT nishant-holds-3008. Within that session, held out, the
+# spectrogram model separates the BREATHING portions from the HOLDS at AUC 0.87, and the
+# amplitude-free shape-only model at 0.81. Both beat the pure band-energy statistic on the
+# same stream (0.69). So yes - on ranking, this model does separate still-breathing from
+# apnea in the session where band energy cannot. At its honestly-calibrated threshold it
+# converts none of that into an alarm; at the oracle threshold it catches 3/3 of that
+# session's holds with zero false alarms, which is the single result here that would be
+# worth chasing with more data.
+#
+# EASY VERSUS HARD SENSOR PLACEMENT. nishant-holds-2401 is the session where holding your
+# breath barely changes the measured level (in-hold amplitude 0.69 of breathing);
+# justinas-holds-3515 is the easy one (0.18). The energy statistic degrades exactly as
+# expected: its held-out AUC is 0.73 on 2401 against... 0.64 on 3515, which is noisy, but at
+# the oracle threshold the regularised spectrogram model catches 2/3 on the HARD session
+# and 1/3 on the easy one, and the shape-only model's best session is 3515 at 0.92 with
+# 2401 at 0.85. The learned model is not obviously more robust to bad placement than the
+# hand-built ones; on this evidence the two sessions are about equally hard for it, which
+# is itself mildly encouraging given how much harder 2401 is for an amplitude detector.
+#
+# WHERE THE TIME WENT, since it was asked. Data preparation is not the cost: the
+# range-frequency cache is built once for all twelve sessions in 3.5 s and reloaded from
+# `data/deep_spectrogram.npz`, and the shared features come from `load_cached`. Training
+# dominates - about 47 s per fold for the five-member ensemble, about 3 minutes for a full
+# leave-one-subject-out pass, and most of the elapsed time was spent on the several passes
+# needed to answer the questions above rather than on any one fit. The GPU is irrelevant
+# here and was not used: benchmarked on this exact model and batch size, 3 epochs take
+# 2.39 s on CPU and 2.05 s on MPS, a 1.17x difference on a 1.4k-parameter network, which
+# does not pay for the plumbing.
+#
+# WHAT WOULD CHANGE THE ANSWER. Not a bigger network and not a better optimiser. Holds from
+# ten more people, so that "what a hold looks like" has an effective sample size in the
+# hundreds rather than 13; and a calibration that is subject-relative rather than absolute,
+# because the thresholds are where this dies. Until then the shape finding above is worth
+# harvesting as a hand-built statistic - a causal spectral-centroid drop, gated on duration,
+# beside the existing energy chart - rather than as a network.
+#
+# REPRODUCING. `seed_everything(SEED)` seeds python, numpy and torch; ensemble member k uses
+# SEED + 1000k; the epoch count is fixed with no early stopping; the sampler uses a seeded
+# generator, as does every augmentation draw. Two runs of `build().fit(clips)` give
+# identical numbers on CPU. `_check_prefix()` verifies predict(clip[:k]) == predict(clip)[:k]
+# exactly, and passes.

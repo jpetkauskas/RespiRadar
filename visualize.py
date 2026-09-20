@@ -579,11 +579,17 @@ def main() -> int:
             frames = partial(simulated_frames, config, breaths_per_min=args.bpm,
                              realtime=True)
             title = f"LIVE - simulator @ {args.bpm:.0f} bpm"
-        # "rhythm" wraps gated/best and vetoes its alarm whenever some range bin still
-        # carries a believable breathing rhythm. It ties gated/best on the board (12/13, no
-        # false alarms) and adds exactly the protection missing there: a still person who is
-        # breathing shallowly looks like apnea on energy, but not on rhythm.
-        data = LiveSource(frames, config, "rhythm")
+        # "gated" - the change-point bank behind the presence gate. This is the one verified
+        # frame-by-frame through the live path on real recordings.
+        #
+        # The rhythm veto was briefly the default here and is NOT, deliberately. It blocks an
+        # alarm whenever it believes a breathing rhythm is still present, and on a weak
+        # signal the residual after breathing stops can be MORE periodic than real breathing
+        # (measured: autocorrelation 0.40-0.58 during holds against 0.16-0.37 while
+        # breathing). On such a setup the veto suppresses exactly the detections it is meant
+        # to protect. It scores well offline on recordings with a strong signal; it is not
+        # safe as a live default until that is understood. --detector rhythm still selects it.
+        data = LiveSource(frames, config, "gated")
         scope = Scope(data, title, live=True)
     else:
         session = session_by_name(args.session)
