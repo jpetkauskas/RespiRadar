@@ -579,10 +579,11 @@ def main() -> int:
             frames = partial(simulated_frames, config, breaths_per_min=args.bpm,
                              realtime=True)
             title = f"LIVE - simulator @ {args.bpm:.0f} bpm"
-        # "gated" is the live detector: it consumes the streaming feature row directly and
-        # will not alarm at an empty room. spectral scores as well but resolves its features
-        # per recorded session, so it cannot run on a sensor.
-        data = LiveSource(frames, config, "gated")
+        # "rhythm" wraps gated/best and vetoes its alarm whenever some range bin still
+        # carries a believable breathing rhythm. It ties gated/best on the board (12/13, no
+        # false alarms) and adds exactly the protection missing there: a still person who is
+        # breathing shallowly looks like apnea on energy, but not on rhythm.
+        data = LiveSource(frames, config, "rhythm")
         scope = Scope(data, title, live=True)
     else:
         session = session_by_name(args.session)

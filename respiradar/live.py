@@ -51,12 +51,27 @@ def fit_on_everything(detector):
 class LiveDetector:
     """Feeds frames through the feature extractor and a detector, one at a time."""
 
-    def __init__(self, config: RadarConfig, detector, buffer_s: float = BUFFER_S) -> None:
+    def __init__(self, config: RadarConfig, detector, buffer_s: float = BUFFER_S,
+                 aux=("rhythm", "spectral")) -> None:
         self.config = config
         self.detector = fit_on_everything(detector)
         self.extractor = FeatureExtractor(config)
         self.max_frames = int(buffer_s * config.frame_rate)
         self.every = max(1, int(EVALUATE_EVERY_S * config.frame_rate))
+
+        # Some detectors compute their own features from raw IQ and look them up by session
+        # name - rhythm's band-fraction and spectral's range-STFT both do. Live there is no
+        # session, so their extractors are run over the frame buffer and registered under
+        # the name the live clip uses. A detector that needs neither is unaffected.
+        self.aux = []
+        for name in aux:
+            try:
+                module = __import__(f"respiradar.detectors.{name}", fromlist=["x"])
+                if hasattr(module, "extract") and hasattr(module, "register"):
+                    self.aux.append(module)
+            except Exception:
+                pass
+        self.frames_buffer: list = []
 
         self.times: list[float] = []
         self.rows: list[np.ndarray] = []
@@ -68,10 +83,14 @@ class LiveDetector:
         row = self.extractor.process(frame)
         self.times.append(frame.t)
         self.rows.append(row)
+        if self.aux:
+            self.frames_buffer.append(frame)
         if len(self.times) > self.max_frames:
             self.times.pop(0)
             self.rows.pop(0)
             self.alarms.pop(0)
+            if self.frames_buffer:
+                self.frames_buffer.pop(0)
 
         self._since_eval += 1
         if self._since_eval >= self.every and len(self.times) > 40:
@@ -84,6 +103,12 @@ class LiveDetector:
         t = np.asarray(self.times)
         X = np.asarray(self.rows)
         clip = Clip("live", t, X, np.zeros(len(t), dtype=bool), [])
+        for module in self.aux:
+            try:
+                at, aX = module.extract(self.frames_buffer, self.config)
+                module.register("live", at, aX)
+            except Exception:
+                pass  # a detector that cannot supply its own features falls back
         try:
             return bool(np.asarray(self.detector.predict(clip))[-1])
         except Exception:

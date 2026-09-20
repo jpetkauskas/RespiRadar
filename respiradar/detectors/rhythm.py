@@ -13,15 +13,36 @@ breathing more shallowly. That is the failure the user reported watching live.
 
 So this detector never asks how big the motion is. It asks whether the motion is PERIODIC.
 
-    R = the fraction of a range bin's spectral power, over the last 12 s, that falls in
-        0.18-0.55 Hz (11-33 breaths per minute), taken over the whole 0.03-2.0 Hz range.
+    R = the fraction of a range bin's spectral power, over the last 16 s, that falls in
+        0.18-0.55 Hz (11-33 breaths per minute), out of everything in 0.03-2.0 Hz.
+        The statistic is the largest R over every range bin whose reflection is strong
+        enough for its phase to mean anything.
 
 R is a ratio of powers, so it is scale-free by construction: multiply the chest motion by
 a hundred or by a hundredth and R does not move. A shallow but regular chest still puts
 most of its power on its own breathing line. A held breath has no line at all - the power
-goes to drift below the band and to phase noise above it, and R collapses. Measured on the
-decisive session, mature hold frames against breathing frames: AUC 0.986, median R 0.84
-breathing against 0.45 holding, on data where rms_4s separates the wrong way round.
+goes to drift below the band and to phase noise above it, and R collapses.
+
+THE DECISIVE TEST, on `nishant-holds-3008`, the session where breathing is quieter than
+holding. Frames at least one window into a hold, against breathing frames outside the
+transitions:
+
+    statistic   AUC     Cohen's d   median breathing   median holding
+    R           1.000   +4.20       0.928              0.398
+    rms_4s      0.661   +0.70       0.672              0.587
+
+R separates completely: the 5th percentile of breathing frames is 0.791 and the 95th
+percentile of hold frames is 0.705, so every threshold in that gap is perfect on this
+session. `rms_4s` does not separate at all, and over all frames rather than mature ones it
+separates backwards (AUC 0.587 in favour of holds being LOUDER). The shared `autocorr`
+feature reads 0.488 - chance - and `flatness` reads 0.159, i.e. inverted.
+
+Within-session AUC on the other labelled sessions, R against rms_4s:
+
+    nishant-holds-2401     0.994   0.807
+    justinas-holds-3515    0.999   0.911
+    justinas-breath-hold   0.827   0.624
+    breath-hold            0.398   0.862   <- the first-round session, where R fails
 
 Three choices matter more than the rest:
 
@@ -35,18 +56,25 @@ Three choices matter more than the rest:
 2. **Per range bin, then a maximum.** The shared extractor collapses three range points
    around a slowly-chosen chest bin into one waveform. On `nishant-holds-3008` that
    composite carries so little breathing that R computed on it reaches AUC 0.66 - barely
-   better than chance - while the best individual bin reaches 0.99. Breathing appears in
+   better than chance - while the best individual bin reaches 1.00. Breathing appears in
    whichever bin the chest happens to illuminate, and that is not always the bin a tracker
-   picked. Taking a maximum over bins also means the alarm requires EVERY believable bin to
-   be arrhythmic at once, which is a much harder thing for noise to fake than one bin being
-   quiet.
+   picked. Taking a maximum over bins also means an alarm requires EVERY believable bin to
+   be arrhythmic at once, which is much harder for noise to fake than one bin being quiet.
 
-3. **The threshold is absolute, and the dwell is long.** R is dimensionless and comparable
-   across bodies, so it needs no personal reference - which is the entire point, since a
-   personal reference is what makes a person who goes still look apneic. What it does need
-   is time: a 12 s window straddling the start of a hold is half breathing, and single
-   windows of real breathing do drop low when a subject shifts. A hold is the only thing
-   that keeps R down for twenty seconds together.
+3. **A 16 s window.** The band is 0.37 Hz wide, so at 12 s it is four DFT bins and at 8 s
+   barely two; there is no periodicity to measure in a window that holds two breaths.
+   16 s costs latency the product pays for at every hold and buys the separation above:
+   the same test at 12 s gives AUC 0.986 instead of 1.000.
+
+WHERE IT STOPS WORKING, which is the honest part. R separates superbly WITHIN a recording
+and only moderately ACROSS bodies: pooled over every subject, mature hold frames against
+the negative sessions, AUC is 0.795. The absolute level of R rides on reflection geometry
+and SNR - `sleeping` sits at a median 0.87 while `vishnu-sleeping`, also breathing
+normally throughout, sits at 0.55, which is below several sessions' hold medians. So an
+absolute threshold does not transfer, and rhythmicity alone (`build_pure`) reaches 2/13
+holds at one false alarm, against 12/13 at zero for the energy-based charts. What is
+delivered as `build()` is therefore rhythm as a CONFIRMATION on the existing alarm rather
+than a replacement for it: see RhythmConfirmedDetector.
 
 Everything is causal: windows look backwards only, state is updated frame by frame, and
 nothing is normalised by a statistic of the whole recording.
@@ -54,7 +82,7 @@ nothing is normalised by a statistic of the whole recording.
 What was tried and did not survive
 ----------------------------------
 - Autocorrelation peak height at the breathing lag, on the narrow band: AUC 0.56-0.60.
-  With a 12 s window the band is ~4 DFT bins wide, so the narrow-band autocorrelation is
+  With a short window the band is a handful of DFT bins wide, so the autocorrelation is
   nearly sinusoidal whatever it is fed, and its peak height measures very little.
 - Phase coherence of the dominant line across consecutive windows: 0.64 on the decisive
   session, and it inverts on others. Adjacent Hann windows overlap by 90%, so their phases
@@ -67,8 +95,10 @@ What was tried and did not survive
   chest bins do, because they are all looking at the same drift.
 - Median and mean of R across bins instead of the maximum: 0.87-0.95, consistently below
   the maximum. Most bins see nothing even while someone is breathing.
-- Logistic regression over (R_max, R_top3, R_med, n50, peak_hz): see `build_model`. It is
-  worse than the 1-D rule and is kept only to show the margin.
+- Logistic regression over (R_max, R_top3, R_med, n50, peak_hz): 0/13 holds and five
+  false alarms, leave-one-subject-out. It is kept as `build_model` to show the margin -
+  with thirteen events, and an absolute level that is partly geometry, a fitted boundary
+  learns the training subjects' geometry and transfers worse than a constant does.
 """
 
 from __future__ import annotations
@@ -368,8 +398,11 @@ class RhythmDetector:
       reference does not move under them. Someone who stops breathing loses the line, and
       only then does it move.
 
-    Scored leave-one-subject-out: 3/13 holds at zero false alarms. That is well behind the
-    12/13 the energy-based charts reach, and the honest reading is in the module docstring:
+    Scored leave-one-subject-out, presence-gated: 2/13 holds and one false alarm - and
+    that false alarm is on `justinas-breath-hold`, the session whose labels are suspected
+    of being ~20 s early, so it may well be a real hold under the wrong label. Either way
+    it is far behind the 12/13 at zero the energy-based charts reach, and the reading is
+    the one in the module docstring:
     R separates hold from breathing beautifully WITHIN a recording and only moderately
     ACROSS bodies, because its absolute level rides on reflection geometry. `fit` is a
     no-op - every threshold here is a constant, and with thirteen events anything learned
@@ -380,9 +413,9 @@ class RhythmDetector:
 
     def __init__(
         self,
-        floor: float = 0.60,
-        ratio: float = 0.70,
-        dwell_s: float = 14.0,
+        floor: float = 0.50,
+        ratio: float = 0.55,
+        dwell_s: float = 12.0,
         motion: float = 40.0,
     ) -> None:
         self.floor = floor
@@ -478,7 +511,10 @@ class RhythmConfirmedDetector:
 
 
 class RhythmModelDetector:
-    """Logistic regression over the rhythm features. Kept to document that it loses."""
+    """Logistic regression over the rhythm features. 0/13 holds, 5 false alarms.
+
+    Kept because the negative result is worth recording: see the module docstring.
+    """
 
     name = "rhythm/logistic"
 
@@ -521,8 +557,14 @@ def build():
 
 
 def build_pure():
-    """Rhythmicity alone, alarming on its own. The thesis, measured without help."""
-    return RhythmDetector()
+    """Rhythmicity alone, alarming on its own. The thesis, measured without help.
+
+    Presence-gated like every other entry, so that the empty-room session is not counted
+    against a question this detector was told not to answer.
+    """
+    from respiradar.detectors.gated import PresenceGatedDetector
+
+    return PresenceGatedDetector(inner=RhythmDetector(), name="rhythm/bandfrac+presence")
 
 
 def build_model():

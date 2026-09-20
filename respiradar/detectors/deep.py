@@ -292,7 +292,7 @@ def patches(stream: np.ndarray, idx: np.ndarray) -> np.ndarray:
 # =======================================================================================
 # The network
 # =======================================================================================
-def _make_net(n_channels: int, width: int = 16):
+def _make_net(n_channels: int, width: int = 16, dropout: float = 0.3):
     import torch
     from torch import nn
 
@@ -305,7 +305,7 @@ def _make_net(n_channels: int, width: int = 16):
 
         def __init__(self) -> None:
             super().__init__()
-            self.drop = nn.Dropout(0.3)
+            self.drop = nn.Dropout(dropout)
             self.c1 = nn.Conv1d(n_channels, width, 3, dilation=1)
             self.c2 = nn.Conv1d(width, width, 3, dilation=3)
             self.c3 = nn.Conv1d(width, width, 3, dilation=9)
@@ -345,6 +345,10 @@ class DeepApneaDetector:
         width: int = 16,
         lr: float = 3e-3,
         weight_decay: float = 1e-3,
+        n_models: int = 1,
+        dropout: float = 0.3,
+        noise: float = 0.15,
+        event_weighted: bool = False,
         seed: int = SEED,
     ) -> None:
         self.mode = mode
@@ -356,7 +360,12 @@ class DeepApneaDetector:
         self.width = width
         self.lr = lr
         self.weight_decay = weight_decay
+        self.n_models = n_models
+        self.dropout = dropout
+        self.noise = noise
+        self.event_weighted = event_weighted
         self.seed = seed
+        self.nets: list = []
         self.net = None
         self.centre = None
         self.scale = None
@@ -364,7 +373,7 @@ class DeepApneaDetector:
 
     # -- fitting -------------------------------------------------------------------
     def _xy(self, clips: Sequence[Clip], stride: int = 5):
-        S, Y, G = [], [], []
+        S, Y, G, W = [], [], [], []
         for clip in clips:
             stream = channels_for(clip, self.mode)
             idx = np.arange(0, len(clip.t), stride)
@@ -372,15 +381,29 @@ class DeepApneaDetector:
             if not len(idx):
                 continue
             S.append(patches(stream, idx))
-            Y.append(clip.y[idx].astype(np.float32))
+            yy = clip.y[idx].astype(np.float32)
+            Y.append(yy)
             G.append(np.full(len(idx), clip.name))
-        return np.concatenate(S), np.concatenate(Y), np.concatenate(G)
+            # Event weighting: 13 holds is the effective sample size, not 40,000 frames.
+            # Every hold gets the same total weight, and so does every negative recording,
+            # so a 40 s hold does not outvote a 27 s one and a long quiet session does not
+            # outvote a short one.
+            w = np.ones(len(idx), dtype=np.float32)
+            for hold in clip.holds:
+                inside = (clip.t[idx] >= hold.start_s) & (clip.t[idx] < hold.end_s)
+                if inside.any():
+                    w[inside] = 1.0 / inside.sum()
+            neg = yy < 0.5
+            if neg.any():
+                w[neg] = 1.0 / neg.sum()
+            W.append(w)
+        return np.concatenate(S), np.concatenate(Y), np.concatenate(G), np.concatenate(W)
 
     def fit(self, clips: Sequence[Clip]) -> None:
         import torch
 
         seed_everything(self.seed)
-        X, y, _ = self._xy(clips)
+        X, y, _, w = self._xy(clips)
         # Scaler fitted on TRAINING CLIPS ONLY - never on the clip being scored.
         flat = X.reshape(-1, X.shape[-1])
         self.centre = np.median(flat, axis=0)
@@ -388,22 +411,45 @@ class DeepApneaDetector:
         self.scale = np.maximum(iqr, 1e-3)
 
         Xn = ((X - self.centre) / self.scale).astype(np.float32)
-        net = _make_net(Xn.shape[-1], self.width)
-        opt = torch.optim.Adam(net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         pos = max(float(y.sum()), 1.0)
         neg = max(float((1 - y).sum()), 1.0)
         pos_weight = torch.tensor(neg / pos, dtype=torch.float32)
-        loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
 
-        g = torch.Generator().manual_seed(self.seed)
         xt = torch.from_numpy(Xn)
         yt = torch.from_numpy(y)
+        if self.event_weighted:
+            wt = torch.from_numpy(w / w.mean())
+        else:
+            wt = torch.ones(len(xt))
         n = len(xt)
-        nf = None
-        if self.mode in ("spec", "both"):
-            nf = 2 * SpectrogramExtractor().n_freq
+        self.nf = 2 * SpectrogramExtractor().n_freq if self.mode in ("spec", "both") else 0
+        self.nets = []
+        losses = [0.0]
+        for member in range(self.n_models):
+            seed = self.seed + 1000 * member
+            torch.manual_seed(seed)
+            net = _make_net(Xn.shape[-1], self.width, self.dropout)
+            opt = torch.optim.Adam(net.parameters(), lr=self.lr,
+                                   weight_decay=self.weight_decay)
+            g = torch.Generator().manual_seed(seed)
+            net.train()
+            losses = self._train_one(net, opt, g, xt, yt, wt, loss_fn, n)
+            net.eval()
+            self.nets.append(net)
+        self.net = self.nets[0]
 
-        net.train()
+        p = self.probabilities_from(xt)
+        self.train_report = {
+            "n_train": int(n),
+            "final_loss": round(losses[-1], 4),
+            "train_auc": round(_auc(y, p), 4),
+            "clips": [c.name for c in clips],
+        }
+
+    def _train_one(self, net, opt, g, xt, yt, wt, loss_fn, n):
+        import torch
+
         losses = []
         for epoch in range(self.epochs):
             perm = torch.randperm(n, generator=g)
@@ -414,28 +460,28 @@ class DeepApneaDetector:
                 # Augmentation. Amplitude scaling is deliberately absent: the inputs are
                 # already ratios to this person's own normal, so a global gain is a no-op -
                 # which is the property that is supposed to make this transfer.
-                xb = xb + 0.15 * torch.randn(xb.shape, generator=g)
-                if nf:  # frequency roll: a different breathing rate, same structure
+                xb = xb + self.noise * torch.randn(xb.shape, generator=g)
+                if self.nf:  # frequency roll: a different breathing rate, same structure
                     shift = int(torch.randint(-2, 3, (1,), generator=g))
                     if shift:
-                        xb[:, :, :nf] = torch.roll(xb[:, :, :nf], shift, dims=2)
+                        xb[:, :, :self.nf] = torch.roll(xb[:, :, :self.nf], shift, dims=2)
                 opt.zero_grad()
-                loss = loss_fn(net(xb), yt[batch])
+                loss = (loss_fn(net(xb), yt[batch]) * wt[batch]).mean()
                 loss.backward()
                 opt.step()
                 total += float(loss.detach()) * len(batch)
             losses.append(total / n)
-        net.eval()
-        self.net = net
+        return losses
 
+    def probabilities_from(self, xt):
+        import torch
+
+        out = np.zeros(len(xt))
         with torch.no_grad():
-            p = torch.sigmoid(net(xt)).numpy()
-        self.train_report = {
-            "n_train": int(n),
-            "final_loss": round(losses[-1], 4),
-            "train_auc": round(_auc(y, p), 4),
-            "clips": [c.name for c in clips],
-        }
+            for net in self.nets:
+                chunks = [torch.sigmoid(net(xt[i : i + 4096])) for i in range(0, len(xt), 4096)]
+                out += torch.cat(chunks).numpy()
+        return out / len(self.nets)
 
     # -- prediction ----------------------------------------------------------------
     def probabilities(self, clip: Clip) -> np.ndarray:
@@ -444,11 +490,7 @@ class DeepApneaDetector:
         stream = channels_for(clip, self.mode)
         idx = np.arange(len(clip.t))
         X = ((patches(stream, idx) - self.centre) / self.scale).astype(np.float32)
-        out = []
-        with torch.no_grad():
-            for start in range(0, len(X), 4096):
-                out.append(torch.sigmoid(self.net(torch.from_numpy(X[start : start + 4096]))))
-        return torch.cat(out).numpy()
+        return self.probabilities_from(torch.from_numpy(X))
 
     def predict(self, clip: Clip) -> np.ndarray:
         p = self.probabilities(clip)
