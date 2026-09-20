@@ -51,3 +51,48 @@ def test_the_breathing_band_isolates_a_plausible_rate(scope_data):
     peak = freqs[band][np.argmax(spectrum[band])]
 
     assert 8 <= peak <= 25, f"dominant period {peak:.1f} bpm is not breathing"
+
+
+def test_panel_ten_replays_the_charts_over_the_detectors_window():
+    """The chart panel must compute what the alarm computes, not a shorter replay of it.
+
+    The scope used to replay the CUSUM charts over its 30 s *display* window. Twenty of
+    those seconds are the charts' own warmup, leaving 10 s in which a running total can
+    accumulate - the `energy` chart needs 15 s at its per-frame cap to reach threshold, so
+    that curve could not reach 1.0 whatever the sensor saw - and the charts' 75-120 s
+    reference windows collapsed onto the apnea they are supposed to measure against.
+
+    Measured here: 9 s into a labelled hold the panel read 0.57 while the detector's own
+    window read 1.45. A diagnostic panel that goes quiet exactly when the detector is most
+    certain is worse than no panel.
+    """
+    import numpy as np
+
+    from respiradar.bakeoff import Clip, folds
+    from respiradar.dataset import load_cached
+    from respiradar.detectors import changepoint
+
+    session = session_by_name("nishant-holds-2401")
+    t, X, _ = load_cached(session.name)
+    fs = round(1 / float(np.median(np.diff(t))), 3)
+    detector = changepoint.build()
+    detector.fit(folds()[0][0])
+
+    def replay(seconds, at_s):
+        i = int(np.searchsorted(t, at_s))
+        j0 = max(0, i - int(seconds * fs))
+        clip = Clip("live", t[j0 : i + 1], X[j0 : i + 1],
+                    np.zeros(i + 1 - j0, dtype=bool), [])
+        return {k: v[-1] for k, v in detector.progress(clip).items()}
+
+    hold = session.holds[0]
+    at = hold.end_s - 1
+    panel = replay(visualize.CHART_REPLAY_S, at)
+    short = replay(visualize.WINDOW_S, at)
+
+    assert max(panel.values()) >= 1.0, (
+        f"no chart reaches its threshold {at:.0f}s in, inside a labelled hold: {panel}"
+    )
+    assert max(panel.values()) > max(short.values()), (
+        "the display window is as good as the detector's - this test has stopped biting"
+    )

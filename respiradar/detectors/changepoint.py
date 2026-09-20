@@ -63,6 +63,11 @@ REF_Q = FEATURE_NAMES.index("ref_q25")         # non-ratcheting trailing 25th pe
 HISTORY = FEATURE_NAMES.index("seconds_of_history")
 INTRA = FEATURE_NAMES.index("intra")
 INTER = FEATURE_NAMES.index("inter")
+# The slow-motion score AT THE CHEST, not its maximum over every range bin. The charts want
+# "has this chest stopped moving"; the global maximum answers "is anything in the room
+# moving", which a drifting radiator or the sensor's own near-field clutter can hold high
+# straight through an apnea. See the note beside `inter_chest` in dataset.FEATURE_NAMES.
+INTER_CHEST = FEATURE_NAMES.index("inter_chest")
 DISP = FEATURE_NAMES.index("disp_std_4s")
 
 EPS = 1e-6
@@ -93,7 +98,7 @@ def _trailing_quantile(values, usable, window, gap, q, min_n, stride=4):
 class _Context:
     """Everything a chart needs about one clip, computed once and shared."""
 
-    __slots__ = ("fs", "usable", "drops", "calm")
+    __slots__ = ("fs", "usable", "drops", "calm", "calm_parts")
 
     def __init__(self, clip: Clip, window_s: float, gap_s: float, gate: dict,
                  history_s: float) -> None:
@@ -141,6 +146,15 @@ class _Context:
             # The presence processor's slow-motion score. An independent estimate of chest
             # movement that does not share the band-pass filter's failure modes, and by a
             # wide margin the best-separating and most subject-stable channel here.
+            # The GLOBAL maximum, deliberately, though `inter_chest` reads the same score at
+            # the tracked chest and is the more obviously correct quantity. Substituting it
+            # was tried and measured worse on every axis: 8/13 holds against 12/13, four
+            # false alarms against one, and it broke silence on a subject with no holds. The
+            # chest-local score simply separates less well - median hold/breathe ratio
+            # 0.49-0.71 against the global score's 0.38-0.64 - because the three tracked bins
+            # are the ones whose phase is already band-passed into `rms_4s`, so it adds noise
+            # rather than an independent view. `inter_chest` stays in the feature row as the
+            # diagnostic that tells you whether this sensor's global peak IS the person.
             "inter": drop(np.log(np.maximum(X[:, INTER], 1e-3))),
         }
 
@@ -148,14 +162,19 @@ class _Context:
         disp_med, ok_d = _trailing_quantile(X[:, DISP], usable, window, gap, 0.5, int(10 * fs))
         intra_med = np.where(ok_i, intra_med, 1.35)
         disp_med = np.where(ok_d, disp_med, 1.1)
-        self.calm = (
-            (X[:, INTRA] < gate["intra_k"] * intra_med)
-            & (X[:, INTRA] < gate["intra_abs"])
-            & (X[:, DISP] < gate["disp_k"] * disp_med)
+        # Kept as four named conditions rather than one expression, because "the chart was
+        # reset" is not an actionable answer on a live sensor. Each of these fails for its
+        # own reason and wants its own fix, and on an unfamiliar setup the only way to know
+        # which one is shut is to be told - see `gate_state`.
+        self.calm_parts = {
+            "intra": X[:, INTRA] < gate["intra_k"] * intra_med,
+            "intra abs": X[:, INTRA] < gate["intra_abs"],
+            "disp": X[:, DISP] < gate["disp_k"] * disp_med,
             # A displacement standard deviation far below this person's own normal is a lost
             # radar lock, not a still chest: a live body at a metre never goes that quiet.
-            & (X[:, DISP] > gate["disp_floor_k"] * disp_med)
-        )
+            "disp floor": X[:, DISP] > gate["disp_floor_k"] * disp_med,
+        }
+        self.calm = np.logical_and.reduce(list(self.calm_parts.values()))
 
 
 class Chart:
@@ -341,7 +360,18 @@ class ChangePointDetector:
         to tell them apart.
         """
         ctx = self._context(clip, self.charts[0])
-        return {"calm": ctx.calm.copy(), "usable": ctx.usable.copy()}
+        return {
+            "calm": ctx.calm.copy(),
+            "usable": ctx.usable.copy(),
+            # Which of the four motion conditions is shut. `calm` is their conjunction, so
+            # on its own it says only that something is wrong, and the four want opposite
+            # fixes: `intra`/`disp` mean genuine movement, `intra abs` is the one fixed
+            # threshold in the design and so the one most likely to be wrong on a sensor
+            # that was never used to tune it, and `disp floor` means the radar has lost
+            # lock - or that a real hold went quieter than the floor allows for, which
+            # would suppress the alarm exactly when it is wanted.
+            "parts": {name: mask.copy() for name, mask in ctx.calm_parts.items()},
+        }
 
 
 # The two charts with the most margin: the highest thresholds and the strictest gates. The

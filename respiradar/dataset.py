@@ -121,6 +121,16 @@ FEATURE_NAMES = [
     "ref_ratchet",  # the OLD asymmetric-EMA baseline, kept for comparison
     "seconds_of_history",  # how long this extractor has been running, in seconds
     "warm",  # 0 while the features are provisional, ramping to 1 once they are settled
+    # `inter` above is the slow-motion score's maximum over EVERY range bin, which answers
+    # "is anything in front of the sensor moving slowly" - the right question for a presence
+    # gate and the wrong one for "has this chest stopped". `_select_chest_bin` exists
+    # precisely because the global peak is usually not the person on this hardware: the
+    # near-field spike at 0.30 m is six times brighter than a chest and won 50-99% of frames.
+    # Measured live, a scene whose strongest slow-mover was clutter kept `inter` pinned high
+    # through a real breath hold, so every change-point chart weighted on it sat flat at zero
+    # while the presence gate happily reported "person". This is the same score read at the
+    # chest instead, and it is what the charts should use.
+    "inter_chest",
 ]
 
 
@@ -466,6 +476,9 @@ class FeatureExtractor:
                 ratchet if ratchet > 0 else base,
                 history_s,
                 warm,
+                # Over the same three bins the phase tracker follows, because a chest is
+                # wider than one 6 cm range point.
+                float(presence.inter[low : low + 3].max()),
             ],
             dtype=float,
         )

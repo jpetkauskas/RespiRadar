@@ -66,9 +66,14 @@ from respiradar.dataset import (
     session_by_name,
 )
 from respiradar.detectors.gated import PRESENCE_THRESHOLD, PRESENCE_WINDOW_S
+from respiradar.live import EVALUATE_WINDOW_S
 from respiradar.sources import BASE_STEP_M, recorded_config, replay_frames
 
 WINDOW_S = 30.0          # how much history the time plots show
+# How much history panel 10 REPLAYS the CUSUM charts over, as opposed to draws. It must
+# match the window the live detector evaluates on, or the panel that exists to explain the
+# alarm computes something the alarm never saw.
+CHART_REPLAY_S = EVALUATE_WINDOW_S
 CONSTELLATION_S = 6.0
 BAND = (0.18, 0.55)      # the band where breaths actually live
 
@@ -404,9 +409,58 @@ class Scope(QtWidgets.QMainWindow):
         self.p_cusum.setYRange(0, 1.4)
         self._progress = None
         self._progress_at = -1
+        self._gate_state = None
+        self._cusum_detector = None
+        self._chart_lock = threading.Lock()
+        self._chart_busy = False
 
         for c in range(3):
             self.win.ci.layout.setColumnStretchFactor(c, 1)
+
+    # ----------------------------------------------------------- chart replay
+    def _maybe_start_chart_replay(self, t, features, i, fs):
+        """Recompute panel 10 in the background, about once a second.
+
+        One replay over CHART_REPLAY_S takes a second or two - the charts are python loops
+        over every frame of the window. Doing that inside the Qt thread stalls the scope
+        between frames, so a draw only ever reads the last finished result and starts the
+        next one.
+        """
+        with self._chart_lock:
+            # abs(): the slider seeks backwards too, and a jump to an earlier frame needs a
+            # fresh replay just as much as advancing past one does.
+            if self._chart_busy or abs(i - self._progress_at) <= int(fs):
+                return
+            self._chart_busy = True
+
+        j0 = max(0, i - int(CHART_REPLAY_S * fs))
+        window = np.asarray(t[j0 : i + 1])
+        rows = np.asarray(features[j0 : i + 1])
+
+        def run():
+            progress = gate_state = None
+            try:
+                from respiradar.bakeoff import Clip
+                if self._cusum_detector is None:
+                    from respiradar.bakeoff import folds
+                    from respiradar.detectors import changepoint
+                    detector = changepoint.build()
+                    detector.fit(folds()[0][0])
+                    self._cusum_detector = detector
+                clip = Clip("live", window, rows,
+                            np.zeros(len(window), dtype=bool), [])
+                progress = self._cusum_detector.progress(clip)
+                gate_state = self._cusum_detector.gate_state(clip)
+            except Exception:
+                pass  # a panel that cannot draw must not take the scope down with it
+            with self._chart_lock:
+                if progress is not None:
+                    self._progress = (window, progress)
+                    self._gate_state = gate_state
+                self._progress_at = i
+                self._chart_busy = False
+
+        threading.Thread(target=run, daemon=True).start()
 
     # -------------------------------------------------------------- controls
     def _controls(self):
@@ -496,28 +550,27 @@ class Scope(QtWidgets.QMainWindow):
             else:
                 self.spec_peak.hide()
 
-        # Panel 10: how close each CUSUM chart is to firing. Recomputed about once a second
-        # - it replays the charts over the window, which is the detector's expensive part.
-        if self._progress is None or i - self._progress_at > int(fs):
-            try:
-                from respiradar.bakeoff import Clip
-                from respiradar.detectors import changepoint
-                if not hasattr(self, "_cusum_detector"):
-                    from respiradar.bakeoff import folds
-                    self._cusum_detector = changepoint.build()
-                    self._cusum_detector.fit(folds()[0][0])
-                j0 = max(0, i - int(WINDOW_S * fs))
-                sub = Clip("live", t[j0 : i + 1], d["features"][j0 : i + 1],
-                           np.zeros(i + 1 - j0, bool), [])
-                self._progress = (t[j0 : i + 1], self._cusum_detector.progress(sub))
-                self._gate_state = self._cusum_detector.gate_state(sub)
-                self._progress_at = i
-            except Exception:
-                self._progress = None
-        if self._progress:
-            pt, charts = self._progress
+        # Panel 10: how close each CUSUM chart is to firing.
+        #
+        # Replayed over CHART_REPLAY_S, NOT over the 30 s this panel draws. That distinction
+        # is the whole point. The charts reset their running total at the start of whatever
+        # clip they are handed and ignore its first `warm_s` = 20 s, and their references are
+        # trailing medians over 75-120 s windows. Hand them a 30 s clip and both break:
+        # only 10 s of it can accumulate - the `energy` chart needs 15 s at its cap just to
+        # reach threshold, so its curve could not reach 1.0 whatever the sensor saw - and the
+        # reference median for "this person's normal" gets computed from inside the very
+        # apnea it is supposed to measure against, which collapses the drop statistic to
+        # nothing. Measured on nishant-holds-2401 at 9 s into a hold: over 30 s the charts
+        # read patient 0.57 / energy 0.47, over 90 s the same frame reads 1.45 / 0.96. The
+        # panel was reporting near-zero exactly when the detector was most certain.
+        self._maybe_start_chart_replay(t, d["features"], i, fs)
+        with self._chart_lock:
+            progress = self._progress
+        if progress:
+            pt, charts = progress
+            keep = pt >= t[i] - WINDOW_S
             for (name, curve), key in zip(self.cusum_curves.items(), charts):
-                curve.setData(pt, charts[key])
+                curve.setData(pt[keep], charts[key][keep])
 
         self.c_det.setData(t[lo : i + 1], d["alarms"][lo : i + 1].astype(float))
         self.now_line.setPos(t[i])
@@ -584,7 +637,18 @@ class Scope(QtWidgets.QMainWindow):
         if gs is not None and len(gs["calm"]):
             calm = bool(gs["calm"][-1]); usable = bool(gs["usable"][-1])
             if not calm:
-                gate_txt, gate_col = "moving", WARN
+                # Name the condition, not just the verdict. "moving" was true and useless:
+                # the gate is four AND-ed tests and they want opposite fixes, so on an
+                # unfamiliar sensor the only thing worth reporting is WHICH one is shut.
+                # Over the last second, not this instant, because it flickers frame to frame
+                # and an unreadable readout is how this went undiagnosed in the first place.
+                recent = slice(-min(len(gs["calm"]), int(fs)), None)
+                shut = sorted(
+                    gs.get("parts", {}).items(),
+                    key=lambda kv: float(np.mean(kv[1][recent])),
+                )
+                gate_txt = f"moving: {shut[0][0]}" if shut else "moving"
+                gate_col = WARN
             elif not usable:
                 gate_txt, gate_col = "no reference", WARN
             else:
