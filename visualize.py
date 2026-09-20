@@ -50,9 +50,13 @@ WHAT YOU ARE LOOKING AT, panel by panel:
 from __future__ import annotations
 
 import argparse
+import csv
+import re
 import sys
 import threading
 import traceback
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
@@ -167,10 +171,24 @@ class LiveSource:
     arrays that get longer. Everything downstream indexes the same way.
     """
 
-    def __init__(self, frames, config, detector_name="gated"):
+    def __init__(self, frames, config, detector_name="gated", record_to=None,
+                 label="", subject=""):
         import importlib
 
         from respiradar.live import LiveDetector
+
+        # Recording while the scope runs, so one session gives both the live check and the
+        # data to tune against. Every threshold in this detector was fitted on recordings
+        # from one rig; a rig that trips the motion gate cannot be fixed by guessing at
+        # those constants, only by being in the dataset. Written in `datalog.py`'s format -
+        # same .h5 attrs, same row in sessions.csv - so the file registers as an ordinary
+        # session with no extra step.
+        self.record_to = Path(record_to) if record_to else None
+        self.label, self.subject = label, subject
+        self.markers: list[float] = []
+        self._gen = None
+        self._stop = False
+        self._finished = threading.Event()
 
         mod = importlib.import_module(f"respiradar.detectors.{detector_name}")
         build = getattr(mod, "build_best", mod.build)
@@ -197,9 +215,55 @@ class LiveSource:
 
         threading.Thread(target=self._run, daemon=True).start()
 
+    def mark(self) -> float | None:
+        """Timestamp the current frame. Enter in `datalog.py`, the MARK button here."""
+        if not self._t:
+            return None
+        self.markers.append(float(self._t[-1]))
+        return self.markers[-1]
+
+    def finish(self) -> None:
+        """Stop the sensor, flush the recording and write its metadata."""
+        self._stop = True
+        if self._gen is not None:
+            self._finished.wait(timeout=5.0)
+        if not self.record_to or not self.record_to.exists() or not self._t:
+            return
+        import h5py
+
+        duration = float(self._t[-1])
+        with h5py.File(self.record_to, "a") as f:
+            f.attrs["label"] = self.label
+            f.attrs["subject"] = self.subject
+            f.attrs["notes"] = "recorded from visualize.py"
+            f.attrs["source"] = "xm125"
+            f.attrs["start_frame"] = 0
+            f.attrs["duration_s"] = duration
+            f.attrs["markers_s"] = np.asarray(self.markers, dtype=float)
+
+        manifest = self.record_to.parent / "sessions.csv"
+        is_new = not manifest.exists()
+        with manifest.open("a", newline="") as fh:
+            writer = csv.writer(fh)
+            if is_new:
+                writer.writerow(
+                    ["file", "subject", "label", "start_frame", "duration_s", "frames",
+                     "delayed", "frame_rate", "sweeps", "markers_s", "notes"]
+                )
+            writer.writerow([
+                self.record_to.name, self.subject, self.label, 0, f"{duration:.1f}",
+                len(self._t), 0, self.config.frame_rate, self.config.sweeps_per_frame,
+                " ".join(f"{m:.1f}" for m in self.markers), "recorded from visualize.py",
+            ])
+        print(f"\nsaved {len(self._t)} frames, {duration:.0f} s, "
+              f"{len(self.markers)} markers -> {self.record_to}")
+
     def _run(self):
         try:
-            for frame in self.frames():
+            self._gen = self.frames()
+            for frame in self._gen:
+                if self._stop:
+                    break
                 row = self.live.process(frame)
                 mean_sweep = frame.iq.mean(axis=0)
                 ex = self.live.extractor
@@ -221,6 +285,15 @@ class LiveSource:
         except Exception as exc:
             traceback.print_exc()
             self.error = str(exc)
+        finally:
+            # Closing the generator runs `radar_frames`' own teardown, which stops the
+            # session and closes the H5Recorder. Without it the file is left truncated.
+            try:
+                if self._gen is not None:
+                    self._gen.close()
+            except Exception:
+                pass
+            self._finished.set()
 
     def __len__(self):
         return len(self._t)
@@ -479,7 +552,17 @@ class Scope(QtWidgets.QMainWindow):
         self.clock = QtWidgets.QLabel("0.0 s")
         self.clock.setStyleSheet("color:#8b949e; min-width:70px;")
         bar.addWidget(self.clock)
+
         return bar
+
+    def closeEvent(self, event):
+        """Flush the recording before the window goes away."""
+        try:
+            if hasattr(self.d, "finish"):
+                self.d.finish()
+        except Exception:
+            traceback.print_exc()
+        super().closeEvent(event)
 
     def toggle(self):
         self.playing = not self.playing
@@ -701,6 +784,11 @@ def main() -> int:
     parser.add_argument("--port", help="live: serial port of the XM125")
     parser.add_argument("--baudrate", type=int, default=230400)
     parser.add_argument("--no-flow-control", action="store_true")
+    parser.add_argument("--record", metavar="LABEL",
+                        help="record this live session to data/ while the scope runs, "
+                             "e.g. --record breath-hold or --record talking")
+    parser.add_argument("--subject", default="demo",
+                        help="who is being recorded, for --record")
     parser.add_argument("--simulate", action="store_true",
                         help="live pipeline, synthetic sensor - no hardware needed")
     parser.add_argument("--bpm", type=float, default=14.0)
@@ -730,17 +818,30 @@ def main() -> int:
 
         config = RadarConfig(sweeps_per_frame=8)
         port = None if args.simulate else (args.port or detected)
+        record_to = None
         if port:
             from main import fit_config
 
             config = fit_config(config, args.baudrate)
+            if args.record:
+                def slug(text):
+                    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "unnamed"
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                data_dir = Path("data")
+                data_dir.mkdir(parents=True, exist_ok=True)
+                record_to = data_dir / (
+                    f"{slug(args.subject)}_{slug(args.record)}_{stamp}.h5")
+                print(f"recording to {record_to}")
             frames = partial(radar_frames, port, config=config, baudrate=args.baudrate,
-                             flow_control=not args.no_flow_control)
-            title = f"LIVE - {port}"
+                             flow_control=not args.no_flow_control,
+                             record_to=record_to)
+            title = f"LIVE - {port}" + (f" - REC {args.record}" if args.record else "")
             print(f"connecting to {port} at {args.baudrate} baud ...")
         else:
             if not args.simulate:
                 print("no radar found - running the simulator instead")
+            if args.record:
+                print("nothing to record without a sensor - ignoring --record")
             frames = partial(simulated_frames, config, breaths_per_min=args.bpm,
                              realtime=True)
             title = f"LIVE - simulator @ {args.bpm:.0f} bpm"
@@ -754,7 +855,8 @@ def main() -> int:
         # breathing). On such a setup the veto suppresses exactly the detections it is meant
         # to protect. It scores well offline on recordings with a strong signal; it is not
         # safe as a live default until that is understood. --detector rhythm still selects it.
-        data = LiveSource(frames, config, "gated")
+        data = LiveSource(frames, config, "gated", record_to=record_to,
+                          label=args.record or "", subject=args.subject)
         scope = Scope(data, title, live=True)
     else:
         session = session_by_name(args.session)
