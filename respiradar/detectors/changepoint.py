@@ -196,20 +196,28 @@ class Chart:
 # long holds, the second is a faster, `ratio`-heavy chart that shortens the median.
 DEFAULT_CHARTS: list[dict] = [
     dict(
-        note="slow: presence slow-motion score, with a long deadband and a leaky chart",
-        weights={"inter": 1.0, "energy": 0.5},
-        deadband=0.7, cap=0.5, threshold=10.0, decay=0.995, refractory_s=8.0,
-        window_s=60.0, gap_s=4.0,
-        gate=dict(intra_k=2.5, intra_abs=2.0, disp_k=10.0, disp_floor_k=0.2),
+        note="slow: presence slow-motion score, with the quantile reference as support",
+        weights={"inter": 2.0, "energy": 0.5, "ratio_q8": 0.5},
+        deadband=0.4, cap=0.5, threshold=60.0, decay=0.999, refractory_s=0.0,
+        window_s=60.0, gap_s=4.0, history_s=16.0,
+        gate=dict(intra_k=2.5, intra_abs=2.0, disp_k=2.0, disp_floor_k=0.3),
     ),
     dict(
-        note="fast: log ratio against the shipped baseline, which does not follow a hold down",
-        weights={"ratio": 2.0, "energy": 1.0},
-        deadband=0.3, cap=0.3, threshold=120.0, decay=1.0, refractory_s=0.0,
-        window_s=120.0, gap_s=8.0,
-        gate=dict(intra_k=2.5, intra_abs=2.5, disp_k=2.0, disp_floor_k=0.0),
+        note="fast: presence alone, short threshold, wide-open gate",
+        weights={"inter": 0.5},
+        deadband=0.7, cap=0.8, threshold=10.0, decay=0.999, refractory_s=0.0,
+        window_s=90.0, gap_s=6.0, history_s=12.0,
+        gate=dict(intra_k=1.5, intra_abs=2.5, disp_k=2.0, disp_floor_k=0.0),
+    ),
+    dict(
+        note="patient: 8 s energy against the ratcheting reference, long integration",
+        weights={"ratio_8": 0.5, "inter": 0.5},
+        deadband=0.1, cap=0.8, threshold=160.0, decay=0.999, refractory_s=0.0,
+        window_s=120.0, gap_s=8.0, history_s=12.0,
+        gate=dict(intra_k=3.0, intra_abs=10.0, disp_k=2.0, disp_floor_k=0.1),
     ),
 ]
+
 
 
 class ChangePointDetector:
@@ -281,20 +289,28 @@ class ChangePointDetector:
 # variant to reach for if a false alarm in the demo would be worse than a missed hold.
 CONSERVATIVE_CHARTS: list[dict] = [
     dict(
-        note="ratio-led, short reference: quickest of the alarm-free charts",
-        weights={"ratio": 2.0, "energy": 1.0, "ratio_8": 0.5},
-        deadband=0.7, cap=0.2, threshold=80.0, decay=1.0, refractory_s=8.0,
-        window_s=30.0, gap_s=2.0,
-        gate=dict(intra_k=3.0, intra_abs=2.5, disp_k=2.0, disp_floor_k=0.1),
+        note="slow: presence plus both references, no leak, long refractory",
+        weights={"inter": 1.0, "energy": 0.5, "ratio_8": 0.5},
+        deadband=0.1, cap=0.3, threshold=120.0, decay=1.0, refractory_s=8.0,
+        window_s=120.0, gap_s=8.0, history_s=12.0,
+        gate=dict(intra_k=2.0, intra_abs=2.5, disp_k=3.0, disp_floor_k=0.0),
     ),
     dict(
-        note="inter-led, long reference: catches the hold the first chart is too fast for",
-        weights={"inter": 1.0},
-        deadband=0.2, cap=1.5, threshold=160.0, decay=0.999, refractory_s=8.0,
-        window_s=120.0, gap_s=8.0,
-        gate=dict(intra_k=2.5, intra_abs=2.5, disp_k=3.0, disp_floor_k=0.3),
+        note="presence alone, leaky",
+        weights={"inter": 0.5},
+        deadband=0.4, cap=0.8, threshold=30.0, decay=0.995, refractory_s=0.0,
+        window_s=90.0, gap_s=6.0, history_s=12.0,
+        gate=dict(intra_k=2.0, intra_abs=10.0, disp_k=3.0, disp_floor_k=0.1),
+    ),
+    dict(
+        note="energy only, ratcheting reference, very high threshold",
+        weights={"ratio": 1.0, "ratio_8": 0.5, "energy": 0.5},
+        deadband=0.4, cap=0.8, threshold=240.0, decay=0.999, refractory_s=8.0,
+        window_s=30.0, gap_s=2.0, history_s=16.0,
+        gate=dict(intra_k=1.5, intra_abs=2.5, disp_k=2.0, disp_floor_k=0.1),
     ),
 ]
+
 
 
 def build():

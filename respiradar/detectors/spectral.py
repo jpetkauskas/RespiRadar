@@ -22,25 +22,27 @@ So this detector builds its own representation, per range bin, causally:
    A windowed DFT is used rather than an IIR band-pass deliberately: a 0.1 Hz Butterworth
    rings for the better part of ten seconds after the chest stops, and that ringing is
    latency the product pays for. A window only ever carries the past N seconds.
-4. Track the person's own normal as the 75th percentile of A over the trailing 90 s. A
-   percentile rather than an EMA: one large movement cannot latch it the way the shared
-   extractor's asymmetric EMA does, and a hold occupying under a quarter of the window
-   cannot pull it down to meet itself.
+4. Track the person's own normal as a percentile of A over a trailing window. A percentile
+   rather than an EMA: one large movement cannot latch it the way an asymmetric EMA does,
+   and a hold occupying a modest fraction of the window cannot pull it down to meet itself.
+5. Track occupancy as a trailing MAXIMUM of the presence score. An empty room never
+   supplies one, and a maximum - unlike an instantaneous reading - still remembers the
+   breathing from before a hold, so the gate does not veto the frames it exists to catch.
 
-The alarm is a two-branch rule on (A, A_fast / trailing percentile), each with its own
-dwell, with a release hysteresis and a gross-motion gate. See SpectralApneaDetector.
+The alarm is a three-branch rule with a release hysteresis and a gross-motion gate. See
+SpectralApneaDetector.
 
 What was tried and did not survive, recorded so nobody repeats it: per-bin phase coherence
 with the composite, spectral flatness, the peak-to-band fraction, cepstral peak, rolling
 peak-frequency stability and the spatial-profile cosine all separate hold from not-hold at
 barely better than chance here. At a 10 s window the 0.1-0.7 Hz band is only about seven
 DFT bins wide, so there is almost no spectral shape to measure at a latency anyone wants,
-and the periodicity of quiet breathing is simply not that different from the periodicity
-of a torso settling. Amplitude, per range bin, with the noisy bins excluded, is the signal.
+and the periodicity of quiet breathing is not that different from the periodicity of a
+torso settling. Amplitude, per range bin, with the noisy bins excluded, is the signal.
 A logistic regression and a random forest over the whole sorted range-spectral vector were
-also tried, fitted leave-one-subject-out; the best of them reached 1/4 holds at zero false
-alarms, against 3/4 for the rule below. Range structure is largely subject geometry, and a
-model learns the geometry.
+also tried, fitted leave-one-subject-out; the best reached 1/4 holds at zero false alarms
+against 3/4 for the rule, on the first version of this dataset. Range structure is largely
+subject geometry, and a model learns the geometry.
 
 Everything here is causal: state is updated frame by frame, windows only look backwards,
 and nothing is normalised by a statistic of the whole recording. Feeding the extractor a
@@ -59,28 +61,33 @@ from respiradar.presence import PresenceDetector
 from respiradar.sources import recorded_config, replay_frames
 
 LOW_HZ, HIGH_HZ = 0.1, 0.7
-WINDOW_S = 10.0          # STFT window; also the detector's intrinsic lag floor
+WINDOW_S = 10.0          # main STFT window; also the detector's intrinsic lag floor
+FAST_WINDOW_S = 6.0      # shorter window: lower lag, more variance
 BUFFER_S = 20.0
 MIN_SNR = 12.0           # amplitude SNR a range bin needs before its phase is believed
+
+BASE_WINDOW_S = 90.0     # trailing window for "this person's normal"
+BASE_MIN_S = 25.0
+BASE_PCT = 75.0
+
+OCCUPANCY_WINDOW_S = 90.0
+OCCUPANCY_THRESHOLD = 6.0   # PresenceDetector's own intra/inter threshold
 
 FEATURE_NAMES = [
     "A",          # band RMS of the loudest qualified bin, 10 s window (mm)
     "A_fast",     # same with a 6 s window - lower lag, noisier
-    "base",       # asymmetric EMA baseline of A
+    "base",       # asymmetric EMA baseline of A (kept for comparison; not used to alarm)
     "ratio",      # A / base
     "base_p",     # 75th percentile of A over the trailing 90 s - robust "normal"
     "ratio_p",    # A_fast / base_p, the cross-subject scale-free statistic
+    "ratio_slow",  # A / base_p, the same statistic on the steadier window
     "n_act",      # qualified bins within 6 dB of the loudest
     "peak_hz",
     "intra",      # presence fast-motion score
-    "inter",
+    "inter",      # presence slow-motion score
     "n_qual",     # how many bins currently pass the SNR gate
+    "occupied",   # trailing max of the presence score - is anyone in the room at all
 ]
-
-BASE_WINDOW_S = 90.0
-BASE_MIN_S = 25.0
-BASE_PCT = 75.0
-
 
 F = {n: i for i, n in enumerate(FEATURE_NAMES)}
 
@@ -88,29 +95,26 @@ F = {n: i for i, n in enumerate(FEATURE_NAMES)}
 class _BinSpectra:
     """Running STFT over the per-range-bin displacement, one column per frame."""
 
-    def __init__(self, fs: float, n_bins: int, window_s: float) -> None:
+    def __init__(self, fs: float, window_s: float) -> None:
         self.n = int(window_s * fs)
         self.freqs = np.fft.rfftfreq(self.n, 1 / fs)
         self.band = (self.freqs >= LOW_HZ) & (self.freqs <= HIGH_HZ)
+        self.band_hz = self.freqs[self.band]
         self.win = np.hanning(self.n)
         self.cg = float((self.win**2).sum())
         self.ramp = np.arange(self.n) - (self.n - 1) / 2
         self.rr = float((self.ramp**2).sum())
-        self.band_hz = self.freqs[self.band]
 
-    def __call__(self, buf: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """buf: (>=n, n_bins) displacement. Returns (band_rms, peak_rms, peak_index)."""
+    def __call__(self, buf: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """buf: (>=n, n_bins) displacement in mm. Returns (band_rms, peak_bin_index)."""
         x = buf[-self.n :]
         x = x - x.mean(axis=0)
+        # Detrending inside the window, not a high-pass filter: no memory, no ringing.
         x = x - np.outer(self.ramp, (self.ramp @ x) / self.rr)
         power = np.abs(np.fft.rfft(x * self.win[:, None], axis=0)) ** 2
         in_band = power[self.band]
-        scale = 2.0 / (self.n * self.cg)
-        band_rms = np.sqrt(in_band.sum(axis=0) * scale)
-        k = np.argmax(in_band, axis=0)
-        idx = np.clip(np.stack([k - 1, k, k + 1]), 0, in_band.shape[0] - 1)
-        peak_rms = np.sqrt(np.take_along_axis(in_band, idx, 0).sum(axis=0) * scale)
-        return band_rms, peak_rms, k
+        band_rms = np.sqrt(in_band.sum(axis=0) * 2.0 / (self.n * self.cg))
+        return band_rms, np.argmax(in_band, axis=0)
 
 
 class SpectralExtractor:
@@ -119,8 +123,8 @@ class SpectralExtractor:
     def __init__(self, config, baseline_time_const_s: float = 45.0) -> None:
         self.fs = fs = config.frame_rate
         self.presence = PresenceDetector(config)
-        self.slow = _BinSpectra(fs, 0, WINDOW_S)
-        self.fast = _BinSpectra(fs, 0, 6.0)
+        self.slow = _BinSpectra(fs, WINDOW_S)
+        self.fast = _BinSpectra(fs, FAST_WINDOW_S)
         self.buffer_len = int(BUFFER_S * fs)
 
         self.n_bins: int | None = None
@@ -136,9 +140,23 @@ class SpectralExtractor:
         self.base: float | None = None
         self.a_up = 4 / (baseline_time_const_s * fs)
         self.a_down = 0.1 / (baseline_time_const_s * fs)
-        self.history: list[float] = []      # trailing A, for the percentile baseline
+
+        self.history: list[float] = []          # trailing A, for the percentile baseline
         self.history_len = int(BASE_WINDOW_S * fs)
         self.history_min = int(BASE_MIN_S * fs)
+
+        # Occupancy is a trailing MAXIMUM, not an instantaneous reading: during a 30 s hold
+        # the presence score falls, so an instantaneous gate would veto exactly the frames
+        # the detector exists to alarm on. A trailing maximum still remembers the breathing
+        # that came before the hold, and an empty room never supplies any.
+        self.presence_hist: list[float] = []
+        self.presence_len = int(OCCUPANCY_WINDOW_S * fs)
+
+    def _occupancy(self, presence) -> float:
+        self.presence_hist.append(float(max(presence.intra.max(), presence.inter.max())))
+        if len(self.presence_hist) > self.presence_len:
+            self.presence_hist.pop(0)
+        return float(max(self.presence_hist))
 
     def process(self, frame) -> np.ndarray:
         presence = self.presence.process(frame)
@@ -172,6 +190,8 @@ class SpectralExtractor:
         self.buf[-1] = self.unwrapped * MM_PER_RADIAN
         self.filled += 1
 
+        occupancy = self._occupancy(presence)
+
         qualified = (self.amp / self.noise) > MIN_SNR
         if not qualified.any():
             qualified = np.zeros(self.n_bins, dtype=bool)
@@ -179,32 +199,32 @@ class SpectralExtractor:
 
         if self.filled < self.slow.n:
             # No valid spectrum yet. A == 0 marks the row as not-yet-ready; the ratios read
-            # a neutral 1.0 so that nothing downstream mistakes a warmup row for a hold.
+            # a neutral 1.0 so nothing downstream mistakes a warmup row for a hold.
             row = np.zeros(len(FEATURE_NAMES))
             row[F["base"]] = 1e-9
             row[F["ratio"]] = 1.0
-            row[F["base_p"]] = 1e-9
+            row[F["base_p"]] = 0.0
             row[F["ratio_p"]] = 1.0
+            row[F["ratio_slow"]] = 1.0
             row[F["intra"]] = float(presence.intra.max())
             row[F["inter"]] = float(presence.inter.max())
             row[F["n_qual"]] = float(qualified.sum())
+            row[F["occupied"]] = occupancy
             return row
 
-        band_rms, _, peak_k = self.slow(self.buf)
+        band_rms, peak_k = self.slow(self.buf)
         band_rms = np.where(qualified, band_rms, 0.0)
         loud = int(np.argmax(band_rms))
         a = float(band_rms[loud])
         peak_hz = float(self.slow.band_hz[peak_k[loud]])
         n_act = float(np.count_nonzero(band_rms > 0.5 * a)) if a > 0 else 0.0
 
-        if self.filled >= self.fast.n:
-            fast_rms, _, _ = self.fast(self.buf)
-            a_fast = float(np.where(qualified, fast_rms, 0.0).max())
-        else:
-            a_fast = a
+        fast_rms, _ = self.fast(self.buf)
+        a_fast = float(np.where(qualified, fast_rms, 0.0).max())
 
-        # Learns this person's normal. Rises quickly, falls very slowly, so a long hold
-        # cannot quietly drag "normal" down to meet itself.
+        # Kept for comparison with the shared extractor's pattern: rises quickly, falls
+        # very slowly. It latches onto a single large movement, which is why the alarm
+        # uses the percentile below instead.
         if a > 0:
             if self.base is None:
                 self.base = a
@@ -213,9 +233,6 @@ class SpectralExtractor:
                 self.base = (1 - alpha) * self.base + alpha * a
         base = self.base if self.base else 1e-9
 
-        # A trailing percentile is a sturdier "normal" than an EMA across subjects: one
-        # large movement cannot raise it the way an EMA latches, and a hold occupying less
-        # than a quarter of the window cannot lower it.
         self.history.append(a)
         if len(self.history) > self.history_len:
             self.history.pop(0)
@@ -224,6 +241,7 @@ class SpectralExtractor:
         else:
             base_p = 0.0
         ratio_p = min(a_fast / base_p, 10.0) if base_p > 0 else 1.0
+        ratio_slow = min(a / base_p, 10.0) if base_p > 0 else 1.0
 
         return np.array(
             [
@@ -233,11 +251,13 @@ class SpectralExtractor:
                 min(a / base, 10.0),
                 base_p,
                 ratio_p,
+                ratio_slow,
                 n_act,
                 peak_hz,
                 float(presence.intra.max()),
                 float(presence.inter.max()),
                 float(qualified.sum()),
+                occupancy,
             ],
             dtype=float,
         )
@@ -265,41 +285,91 @@ _CACHE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
 
 def _load(path: Path) -> bool:
-    """Populate the in-process cache from disk. False if the file is missing a session."""
+    """Populate the in-process cache from disk. False if the file is stale or missing."""
     if not path.exists():
         return False
     with np.load(path) as data:
+        loaded = {}
         for session in SESSIONS:
             if f"{session.name}__X" not in data:
                 return False  # new recordings have landed since this cache was written
-            _CACHE[session.name] = (data[f"{session.name}__t"], data[f"{session.name}__X"])
+            key = f"{session.name}__X"
+            if data[key].shape[1] != len(FEATURE_NAMES):
+                return False  # the feature set changed since this cache was written
+            loaded[session.name] = (data[f"{session.name}__t"], data[key])
+    _CACHE.update(loaded)
     return True
 
 
 def _session_features(name: str) -> tuple[np.ndarray, np.ndarray]:
     if name not in _CACHE and not _load(CACHE):
-        _CACHE.clear()
         build_cache(CACHE)
         _load(CACHE)
     return _CACHE[name]
 
 
-def features_for(clip: Clip) -> np.ndarray:
-    """My own features for a clip, which may be any time slice of a session.
+def register(name: str, t: np.ndarray, X: np.ndarray) -> None:
+    """Supply this detector's features for a clip it cannot look up by name.
 
-    `clip.X` holds the shared features, so the rows are found by session name and time.
-    The features themselves were extracted by a single causal pass over the whole session,
-    exactly as the shared cache is, so slicing never reveals anything from the future.
+    For anything outside `dataset.SESSIONS` - a synthetic empty room, a live stream, a
+    recording made after this cache was written - run `extract(frames)` and hand the result
+    here under the clip's session name.
     """
+    X = np.asarray(X, dtype=float)
+    if X.ndim != 2 or X.shape[1] != len(FEATURE_NAMES):
+        raise ValueError(
+            f"expected {len(FEATURE_NAMES)} feature columns, got shape {X.shape}"
+        )
+    _CACHE[name] = (np.asarray(t, dtype=float), X)
+
+
+def extract(frames, config=None) -> tuple[np.ndarray, np.ndarray]:
+    """Run the causal extractor over any iterable of Frames. Returns (times, features)."""
+    from respiradar.sources import RadarConfig
+
+    times, rows, extractor = [], [], None
+    for frame in frames:
+        if extractor is None:
+            extractor = SpectralExtractor(config or RadarConfig())
+        times.append(frame.t)
+        rows.append(extractor.process(frame))
+    if extractor is None:
+        return np.zeros(0), np.zeros((0, len(FEATURE_NAMES)))
+    return np.asarray(times), np.asarray(rows)
+
+
+def features_for(clip: Clip) -> np.ndarray:
+    """This module's features for a clip, which may be any time slice of a session.
+
+    Three ways in, in order: a clip whose `X` already carries this module's columns is used
+    as it stands, which is how a harness feeds in a recording nothing here has heard of -
+    an empty room, say; otherwise features registered under the clip's session name; other-
+    wise the on-disk cache, built on first use.
+
+    The features come from a single causal pass over the whole recording, exactly as the
+    shared cache does, so slicing never reveals anything from the future.
+    """
+    X = np.asarray(clip.X) if clip.X is not None else None
+    if X is not None and X.ndim == 2 and X.shape[1] == len(FEATURE_NAMES):
+        return X.astype(float)
+
     name = clip.name.split("[")[0]
-    session_by_name(name)  # raises for an unknown session rather than guessing
-    t, X = _session_features(name)
+    if name not in _CACHE:
+        try:
+            session_by_name(name)
+        except KeyError:
+            raise KeyError(
+                f"no features for clip {clip.name!r}. Call "
+                f"spectral.register({name!r}, *spectral.extract(frames)), or pass a clip "
+                f"whose X already has this module's {len(FEATURE_NAMES)} columns."
+            ) from None
+    t, rows = _session_features(name)
     lo = int(np.searchsorted(t, clip.t[0] - 1e-9))
-    rows = X[lo : lo + len(clip.t)]
-    if len(rows) != len(clip.t):  # pragma: no cover - times always line up here
-        idx = np.searchsorted(t, clip.t - 1e-9)
-        rows = X[np.clip(idx, 0, len(t) - 1)]
-    return rows
+    out = rows[lo : lo + len(clip.t)]
+    if len(out) != len(clip.t):  # pragma: no cover - times normally line up exactly
+        idx = np.clip(np.searchsorted(t, clip.t - 1e-9), 0, len(t) - 1)
+        out = rows[idx]
+    return out
 
 
 def _sustained(flags: np.ndarray, need: int) -> np.ndarray:
@@ -313,21 +383,34 @@ def _sustained(flags: np.ndarray, need: int) -> np.ndarray:
 
 
 class SpectralApneaDetector:
-    """Two branches on the range-STFT, each with its own dwell, plus a release hysteresis.
+    """Three branches on the range-STFT, each with its own dwell, plus hysteresis.
+
+    Each branch trades depth of evidence against how long it has to be there, so that a
+    hold that goes completely still is caught quickly while a hold the subject spends
+    settling through is still caught, only later:
 
     * `quiet`    - an absolute floor in millimetres on the 10 s band RMS of the loudest
-                   qualified bin. Band-limited chest motion under ~0.35 mm is not breathing
-                   for anybody, so this branch needs no knowledge of the subject.
-    * `relative` - the 6 s band RMS against the subject's own trailing 75th percentile.
-                   This is the branch that survives a change of body. It fires on holds
-                   where the subject is still settling and moving half a millimetre - far
-                   too much for the absolute branch, but three times below their own
-                   normal. It pays for that with a long dwell, because a shallow relative
-                   dip is also what a sleeping person's ordinary pause looks like. Eleven
-                   and a half seconds is close to the clinical definition of an apnea
-                   anyway: a cessation of ten seconds or more.
+                   qualified bin. Band-limited chest motion below this is not breathing for
+                   anybody, so the branch needs no knowledge of the subject and gives the
+                   lowest latency when a hold is clean.
+    * `deep`     - the 6 s band RMS against the subject's own trailing percentile, at a
+                   threshold low enough to be unambiguous, with a short dwell. This is the
+                   fast branch for subjects whose normal breathing is large: a millimetre
+                   of motion is silence for them and ordinary breathing for someone else.
+    * `relative` - the same ratio at a looser threshold, paid for with a long dwell. This
+                   catches holds where the subject is still moving half a millimetre - far
+                   too much for the absolute branch, but several times below their own
+                   normal. The dwell is long because a shallow relative dip is also what a
+                   sleeping person's ordinary pause looks like; one of the negatives here
+                   contains eight seconds of complete stillness. Eleven seconds is close to
+                   the clinical definition of an apnea anyway: a cessation of ten or more.
 
-    Once alarmed, the alarm is released only when motion recovers past `release` times both
+    Two gates apply to every branch. `intra_gate` drops frames where something is plainly
+    moving - they are awake, not apnoeic. `occupancy_gate` requires that the presence score
+    has exceeded PresenceDetector's own threshold at some point in the trailing window: an
+    empty room is perfectly still, and stillness is only apnea if there is somebody in it.
+
+    Once alarmed, the alarm is released only when motion recovers past `release` times the
     thresholds. Without that, the quiet tail of a hold breaks into several alarm episodes
     and every one after the first scores as a false alarm.
     """
@@ -338,23 +421,29 @@ class SpectralApneaDetector:
         self,
         quiet_mm: float = 0.35,
         quiet_s: float = 5.0,
+        deep_ratio: float = 0.12,
+        deep_s: float = 4.0,
         rel_ratio: float = 0.30,
-        rel_s: float = 11.5,
+        rel_s: float = 11.0,
         release: float = 2.0,
         intra_gate: float = 4.0,
+        occupancy_gate: float = OCCUPANCY_THRESHOLD,
     ) -> None:
         self.quiet_mm = quiet_mm
         self.quiet_s = quiet_s
+        self.deep_ratio = deep_ratio
+        self.deep_s = deep_s
         self.rel_ratio = rel_ratio
         self.rel_s = rel_s
         self.release = release
         self.intra_gate = intra_gate
+        self.occupancy_gate = occupancy_gate
 
     def fit(self, clips) -> None:
-        """Nothing is learned from the labels. With four holds from two bodies a fitted
-        threshold would memorise them; the numbers here are millimetres of chest motion and
-        multiples of the subject's own running normal, both of which the causal extractor
-        supplies without ever having seen this person before."""
+        """Nothing is learned from the labels. A threshold fitted to thirteen holds from
+        two bodies would memorise those bodies; the numbers here are millimetres of chest
+        motion and multiples of the subject's own running normal, both of which the causal
+        extractor supplies without ever having seen this person before."""
 
     def predict(self, clip: Clip) -> np.ndarray:
         X = features_for(clip)
@@ -364,12 +453,14 @@ class SpectralApneaDetector:
         ratio = X[:, F["ratio_p"]]
         # A == 0 marks a warmup row; base_p == 0 means the percentile has no history yet.
         ready = (a > 0) & (X[:, F["base_p"]] > 0)
-        # Something is obviously moving: they are awake, not apnoeic.
         ready &= X[:, F["intra"]] < self.intra_gate
+        ready &= X[:, F["occupied"]] > self.occupancy_gate
 
-        quiet = _sustained(ready & (a < self.quiet_mm), int(self.quiet_s * fs))
-        relative = _sustained(ready & (ratio < self.rel_ratio), int(self.rel_s * fs))
-        trigger = ready & (quiet | relative)
+        trigger = ready & (
+            _sustained(ready & (a < self.quiet_mm), int(self.quiet_s * fs))
+            | _sustained(ready & (ratio < self.deep_ratio), int(self.deep_s * fs))
+            | _sustained(ready & (ratio < self.rel_ratio), int(self.rel_s * fs))
+        )
 
         recovered = (a > self.release * self.quiet_mm) & (
             ratio > self.release * self.rel_ratio

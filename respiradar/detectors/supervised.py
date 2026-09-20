@@ -108,7 +108,8 @@ def _down_cusum(z: np.ndarray, drift: float, cap: float = 60.0) -> np.ndarray:
 
     S[i] = clip(S[i-1] - (z[i] + drift), 0, cap). It rises only while z sits more than
     `drift` below zero, and decays as soon as the signal comes back, so it measures the
-    depth-times-duration of a drop rather than its instantaneous depth. Causal by shape.
+    depth-times-duration of a drop rather than its instantaneous depth. Causal by shape,
+    and it is the statistic the hand-built change-point entries in this bake-off win on.
     """
     n = len(z)
     out = np.empty(n)
@@ -119,39 +120,22 @@ def _down_cusum(z: np.ndarray, drift: float, cap: float = 60.0) -> np.ndarray:
     return out
 
 
-def _causal_quantile(
-    x: np.ndarray, window_s: float, q: float, valid: np.ndarray | None = None, decim: int = 10
-) -> np.ndarray:
-    """Rolling quantile of the last `window_s` seconds, evaluated on a decimated copy.
-
-    Why a quantile and not the supplied `baseline`: the baseline ratchets up and decays only
-    very slowly, so it tracks the subject's *best* breathing. A person who breathes shallowly
-    for half a minute - which is most of what "sleeping" looks like on some bodies - sits far
-    below that baseline the whole time and is indistinguishable from a hold. A rolling low
-    quantile instead asks "is this quiet even by the standard of how quiet this person has
-    been lately", which a long shallow plateau answers with "no" and a real hold with "yes".
-    Strictly causal: window ends at the current (decimated) sample.
-    """
-    n = len(x)
-    if n == 0:
-        return np.zeros(0)
-    d = np.asarray(x, dtype=float)[::decim]
-    v = np.asarray(valid, dtype=bool)[::decim] if valid is not None else np.ones(len(d), bool)
-    width = max(2, int(window_s * FS / decim))
-    # Expanding until the window is full, rather than padding with the first sample: at the
-    # start of a recording that sample is a filter transient near zero, and padding with it
-    # would make the first two minutes - which is where a hold can hide - look loud. Frames
-    # from before the analysis buffer filled are skipped outright for the same reason.
-    qd = np.empty(len(d))
-    for j in range(len(d)):
-        lo = max(0, j - width + 1)
-        window = d[lo : j + 1][v[lo : j + 1]]
-        qd[j] = np.quantile(window, q) if len(window) >= 3 else d[j]
-    return qd[np.minimum(np.arange(n) // decim, len(qd) - 1)]
-
-
 def augment(X: np.ndarray) -> np.ndarray:
-    """Expand the 12 raw features into the causal context the classifier actually needs."""
+    """Expand the shared feature row into the causal context the classifier needs.
+
+    Column choices, in one line each:
+
+    - Nothing absolute. Reflection amplitude and millimetre rms differ by body and posture,
+      and a model given them learns "this recording" rather than "this hold".
+    - `ratio_*_q`, the shared 25th-percentile self-reference, is preferred over `ratio_*`,
+      which divides by the ratcheting baseline. The ratchet tracks a subject's *best*
+      breathing, so a shallow sleeper sits far below it all night and reads as apnea.
+    - Duration, in several forms. A frame cannot tell a hold from the gap between two
+      breaths; how long it has been quiet can.
+    - Periodicity. Shallow breathing keeps an autocorrelation peak at the breathing period
+      however small its amplitude; a hold has nothing to be periodic about. This is the part
+      that needs no per-body calibration.
+    """
     X = np.asarray(X, dtype=float)
     n = len(X)
     if n == 0:
@@ -160,90 +144,60 @@ def augment(X: np.ndarray) -> np.ndarray:
     rms4 = X[:, F["rms_4s"]]
     rms8 = X[:, F["rms_8s"]]
     rms16 = X[:, F["rms_16s"]]
-    base = np.maximum(X[:, F["baseline"]], 1e-6)
     intra = X[:, F["intra"]]
     inter = X[:, F["inter"]]
     amp = X[:, F["amplitude"]]
     disp = X[:, F["disp_std_4s"]]
     flat = X[:, F["flatness"]]
     ac = X[:, F["autocorr"]]
-    valid = rms16 > 0  # the 16 s analysis buffer has filled; before that the row is a stub
+    ref = np.maximum(X[:, F["ref_q25"]], 1e-6)
+    warm = X[:, F["warm"]]
+    history = X[:, F["seconds_of_history"]]
 
-    # The raw ratio columns blow up to ~1e8 in the first seconds, before the baseline exists.
-    # Clip rather than drop: the same rows are refused an alarm by the warm-up gate anyway.
-    r4 = np.clip(rms4 / base, 0.0, 4.0)
-    r8 = np.clip(rms8 / base, 0.0, 4.0)
-    r16 = np.clip(rms16 / base, 0.0, 4.0)
+    r4 = np.clip(X[:, F["ratio_4s"]], 0.0, 4.0)  # against the ratcheting baseline
+    r8 = np.clip(X[:, F["ratio_8s"]], 0.0, 4.0)
+    q4 = np.clip(X[:, F["ratio_4s_q"]], 0.0, 4.0)  # against the trailing 25th percentile
+    q8 = np.clip(X[:, F["ratio_8s_q"]], 0.0, 4.0)
 
-    # Everything below is dimensionless. Absolute millimetre amplitudes are deliberately
-    # excluded: the breath-hold recording sits at a lower overall amplitude than the other
-    # two sessions, so a model given raw rms learns "this session" instead of "this hold",
-    # and then calls the subject's ordinary breathing apnea. Ratios against the subject's
-    # own slow baseline do not have that hole.
     cols: list[np.ndarray] = [
-        r4, r8, r16,
+        r4, r8, q4, q8,
         np.clip(rms4 / np.maximum(rms16, 1e-6), 0.0, 4.0),
         np.clip(rms4 / np.maximum(rms8, 1e-6), 0.0, 4.0),
         intra, inter, flat, ac,
         # Gross motion relative to in-band motion: talking and fidgeting push this up.
         np.clip(disp / np.maximum(rms4, 1e-6), 0.0, 8.0),
-        # Reflection strength relative to its own recent level - catches the person leaving
+        # Reflection strength against its own recent level - catches the person leaving
         # without letting the model key on how far away they happened to be that day.
         np.clip(amp / np.maximum(_causal_mean(amp, int(30 * FS)), 1e-6), 0.0, 4.0),
+        # How much the model should trust the rest of the row.
+        warm, np.minimum(history, 180.0),
     ]
 
     for w in MEAN_WINDOWS_S:
         k = int(w * FS)
+        cols.append(_causal_mean(q4, k))
+        cols.append(_causal_mean(q8, k))
         cols.append(_causal_mean(r4, k))
-        cols.append(_causal_mean(r8, k))
         cols.append(_causal_mean(intra, k))
-        cols.append(_causal_mean(ac, k))
     for w in MIN_WINDOWS_S:
         k = int(w * FS)
-        cols.append(_causal_min(r4, k))
-        cols.append(_causal_max(r4, k))
+        cols.append(_causal_min(q4, k))
+        cols.append(_causal_max(q4, k))
         cols.append(_causal_max(intra, k))
-    # How much of the recent past was spent below each "quiet" level. This is the feature that
-    # a fixed threshold detector implements by hand, handed to the model at several scales.
+
+    # How much of the recent past was spent below each "quiet" level, at several horizons.
+    # This is what a threshold detector implements by hand, handed over at several scales -
+    # on the self-referenced ratio, so the levels mean the same thing on every body.
     for level in QUIET_LEVELS:
-        q = (r4 < level).astype(float)
-        for w in QUIET_WINDOWS_S:
-            cols.append(_causal_mean(q, int(w * FS)))
+        for source in (q4, r4):
+            q = (source < level).astype(float)
+            for w in QUIET_WINDOWS_S:
+                cols.append(_causal_mean(q, int(w * FS)))
     for level in LOUD_LEVELS:
+        cols.append(_time_since_above(q4, level))
+        cols.append(_time_since_above(q8, level))
         cols.append(_time_since_above(r4, level))
-        cols.append(_time_since_above(r8, level))
 
-    # Self-referencing quietness: the current 4 s energy against low quantiles of the recent
-    # past. This is the part that has to carry across bodies - see _causal_quantile.
-    for window_s in (60.0, 120.0):
-        for q in (0.1, 0.25, 0.5):
-            ref = np.maximum(_causal_quantile(rms8, window_s, q, valid), 1e-6)
-            cols.append(np.clip(rms4 / ref, 0.0, 6.0))
-            cols.append(np.clip(rms8 / ref, 0.0, 6.0))
-    ref50 = np.maximum(_causal_quantile(rms8, 120.0, 0.5, valid), 1e-6)
-    rel = np.clip(rms4 / ref50, 0.0, 6.0)
-    for w in (5.0, 15.0, 30.0):
-        cols.append(_causal_mean(rel, int(w * FS)))
-    # The same "how long has it been quiet" battery as above, but measured on `rel` rather
-    # than on the supplied ratio. Fixed levels on ratio_4s are not comparable between bodies -
-    # one subject breathes at ratio 1.3 and another at 0.65, so "below 0.5" means different
-    # things to each - whereas `rel` is 1.0 by construction whenever a subject is doing what
-    # they have recently been doing.
-    for level in (0.30, 0.50, 0.70):
-        q = (rel < level).astype(float)
-        for w in QUIET_WINDOWS_S:
-            cols.append(_causal_mean(q, int(w * FS)))
-    for level in (0.6, 0.8, 1.0, 1.2):
-        cols.append(_time_since_above(rel, level))
-    for w in (4.0, 10.0):
-        cols.append(_causal_min(rel, int(w * FS)))
-        cols.append(_causal_max(rel, int(w * FS)))
-
-    # Periodicity. Shallow breathing is still breathing: the autocorrelation of the band-
-    # limited signal keeps a clear peak at the breathing period even when its amplitude has
-    # collapsed. A hold has nothing to be periodic about. This is the feature that separates
-    # one subject's quiet sleeping plateau from another subject's breath hold, and it needs
-    # no per-body calibration at all.
     for w in (5.0, 10.0, 20.0, 40.0):
         cols.append(_causal_max(ac, int(w * FS)))
         cols.append(_causal_mean(ac, int(w * FS)))
@@ -252,25 +206,19 @@ def augment(X: np.ndarray) -> np.ndarray:
     for w in (10.0, 30.0):
         cols.append(_causal_min(flat, int(w * FS)))
 
-    # One-sided CUSUM charts on the log energy against the subject's own running median.
-    # A level feature answers "is it quiet now"; a CUSUM answers "how much evidence has piled
-    # up that it went quiet and stayed there", which is the statistic the hand-built
-    # change-point detectors in this bake-off win on. Several drift terms give the classifier
-    # a fast-but-twitchy chart and a slow-but-sure one to combine.
-    z = np.log(np.maximum(rms4, 1e-6)) - np.log(ref50)
-    for drift in (0.15, 0.35, 0.70):
-        cols.append(_down_cusum(z, drift))
-    z8 = np.log(np.maximum(rms8, 1e-6)) - np.log(ref50)
-    for drift in (0.15, 0.35):
-        cols.append(_down_cusum(z8, drift))
-
-    # A short-horizon drop detector. The quantile references above need a minute or two of
-    # history, which a hold in the first half-minute of a recording does not have; this one
-    # only needs its own window, so it is what catches an early hold.
+    # Drop detectors. The percentile reference needs a minute or two of history; these need
+    # only their own window, which is what covers a hold early in a recording.
     for w in (20.0, 40.0, 60.0):
         peak = np.maximum(_causal_max(rms8, int(w * FS)), 1e-6)
         cols.append(np.clip(rms4 / peak, 0.0, 2.0))
         cols.append(np.clip(rms8 / peak, 0.0, 2.0))
+
+    z4 = np.log(np.maximum(rms4, 1e-9)) - np.log(ref)
+    z8 = np.log(np.maximum(rms8, 1e-9)) - np.log(ref)
+    for drift in (0.15, 0.35, 0.70):
+        cols.append(_down_cusum(z4, drift))
+    for drift in (0.15, 0.35):
+        cols.append(_down_cusum(z8, drift))
 
     return np.column_stack(cols)
 
@@ -346,9 +294,10 @@ class SupervisedApneaDetector:
             if not len(clip.t):
                 continue
             feats = augment(clip.X)
-            # Frames before the 16 s analysis buffer is full carry placeholder features
-            # (rms_16s is exactly 0). They are never alarmed on, so they are not trained on.
-            usable = clip.X[:, F["rms_16s"]] > 0
+            # Frames before the 16 s analysis buffer has filled are computed over a partial
+            # window and are not comparable to the rest. They are never alarmed on, so they
+            # are not trained on either.
+            usable = clip.X[:, F["warm"]] >= 1.0
             if not usable.any():
                 continue
             # The features lag the event: the first seconds of a hold still look like
@@ -403,7 +352,7 @@ class SupervisedApneaDetector:
 
         # Gate: never alarm before the feature buffers have filled, in absolute session time
         # as well as time since the clip started (a clip may begin mid-session).
-        ready = clip.X[:, F["rms_16s"]] > 0
+        ready = clip.X[:, F["warm"]] >= 1.0
         ready &= (clip.t - clip.t[0]) >= self.smooth_s
 
         need = max(1, int(self.min_duration_s * FS))
