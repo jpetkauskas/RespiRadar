@@ -52,6 +52,14 @@ SESSIONS: list[Session] = [
     Session("breath-hold", "nishant_breath-hold_20260919-182741.h5", "nishant",
             holds=[Episode(14.3, 41.4), Episode(73.2, 116.4)],
             description="breathe, hold, breathe, hold"),
+    # Recorded from the live scope on the demo rig - the setup the system is actually
+    # shown on, and the one that exposed the motion gate. Scripted: talking and moving
+    # 0-30 s (must never alarm), normal breathing 30-60 s, breath hold 60-90 s, then getting
+    # up. It is in SESSIONS so the demo's own two requirements are scored by the bake-off
+    # like everything else, rather than checked by eye on the day.
+    Session("demo-holds", "nishant_demo_20260920-090443.h5", "nishant",
+            holds=[Episode(60.0, 90.0)],
+            description="talk+move, breathe, hold - recorded on the demo rig"),
     # justinas
     Session("justinas-sleeping-1", "justinas_sleeping_20260919-184132.h5", "justinas"),
     Session("justinas-sleeping-2", "justinas_sleeping_20260919-184458.h5", "justinas"),

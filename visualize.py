@@ -296,7 +296,17 @@ class LiveSource:
             self._finished.set()
 
     def __len__(self):
-        return len(self._t)
+        """The number of frames EVERY array has, not just the longest.
+
+        `_run` appends `_t` first and `_alarm` last, so between those two statements the
+        arrays have different lengths. The scope takes its index from one array and reads
+        the others with it, so a draw landing in that gap indexes past the end of `alarms`
+        and raises inside the Qt timer callback - killing that redraw, APNEA text included.
+        Reporting the shortest length makes every index valid in every array.
+        """
+        return min(len(a) for a in (self._t, self._profile, self._iq, self._bins,
+                                    self._raw, self._feat, self._motion, self._wave,
+                                    self._alarm))
 
     def __getitem__(self, key):
         arrays = {
@@ -574,7 +584,7 @@ class Scope(QtWidgets.QMainWindow):
 
     def step(self):
         if self.live:
-            n = len(self.d["t"])
+            n = len(self.d)
             if n < 2:
                 return
             self.i = n - 1  # live always shows now

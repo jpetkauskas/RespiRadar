@@ -27,6 +27,17 @@ Three things had to be got right before the CUSUM itself mattered.
    into an alarm. The gate is relative to the subject's own recent median, for the same
    reason the statistic is.
 
+   `disp_k` is deliberately loose, and a live recording is what set it. Holding your breath
+   does not make you still: on `demo-holds` the unfiltered displacement std RISES during the
+   hold, 1.34 while breathing against 1.64 while holding, because a held breath is body
+   tension and sway rather than stillness. At the original `disp_k` that tripped the gate on
+   a third of the hold's frames and zeroed the accumulated evidence each time, so the alarm
+   fired at 5 s, was wiped, re-accumulated and fired again - covering 67% of the hold in
+   flickering chunks, which is what someone watching reports as "it alarmed briefly and then
+   went back to normal". Doubling it covers 100%. The price is four false alarms across the
+   23 minutes of older recordings where zero was possible; what it buys is that a real hold
+   alarms continuously instead of intermittently.
+
 3. A deadband and a cap on the per-frame log-likelihood increment. Without the deadband a
    chronically shallow sleeper accumulates a small positive drift for a minute and trips the
    chart; without the cap a momentary loss of radar lock counts for more than a real hold.
@@ -189,7 +200,7 @@ class Chart:
         self.window_s = window_s
         self.gap_s = gap_s
         self.history_s = history_s
-        self.gate = gate or dict(intra_k=2.0, intra_abs=2.5, disp_k=2.0, disp_floor_k=0.15)
+        self.gate = gate or dict(intra_k=2.0, intra_abs=2.5, disp_k=4, disp_floor_k=0.15)
         # A forgetting factor slightly below 1 turns the chart into a rate detector: a small
         # positive drift saturates at a low level, so an hour of slightly shallow breathing
         # never reaches a threshold that eight seconds of a real collapse clears.
@@ -256,28 +267,28 @@ DEFAULT_CHARTS: list[dict] = [
         weights={"inter": 2.0, "energy": 0.5, "ratio_q": 0.5},
         deadband=0.1, cap=1.2, threshold=200.0, decay=0.999, refractory_s=8.0,
         window_s=75.0, gap_s=5.0, history_s=16.0,
-        gate=dict(intra_k=3.0, intra_abs=2.5, disp_k=1.5, disp_floor_k=0.1),
+        gate=dict(intra_k=3.0, intra_abs=2.5, disp_k=3, disp_floor_k=0.1),
     ),
     dict(
         note="presence alone, leaky, low threshold: picks up the holds the first chart misses",
         weights={"inter": 0.5},
         deadband=0.4, cap=0.8, threshold=30.0, decay=0.995, refractory_s=0.0,
         window_s=90.0, gap_s=6.0, history_s=12.0,
-        gate=dict(intra_k=2.0, intra_abs=10.0, disp_k=3.0, disp_floor_k=0.1),
+        gate=dict(intra_k=2.0, intra_abs=10.0, disp_k=6, disp_floor_k=0.1),
     ),
     dict(
         note="energy only, ratcheting reference, no deadband: the fast chart",
         weights={"ratio": 0.5, "energy": 0.5},
         deadband=0.0, cap=0.4, threshold=120.0, decay=0.999, refractory_s=0.0,
         window_s=90.0, gap_s=6.0, history_s=12.0,
-        gate=dict(intra_k=3.0, intra_abs=2.5, disp_k=2.0, disp_floor_k=0.1),
+        gate=dict(intra_k=3.0, intra_abs=2.5, disp_k=4, disp_floor_k=0.1),
     ),
     dict(
         note="8 s energy against the quantile reference, plus presence: shortens the median",
         weights={"ratio_q8": 0.5, "inter": 0.5},
         deadband=0.5, cap=1.5, threshold=30.0, decay=1.0, refractory_s=8.0,
         window_s=120.0, gap_s=8.0, history_s=12.0,
-        gate=dict(intra_k=1.5, intra_abs=3.0, disp_k=1.5, disp_floor_k=0.0),
+        gate=dict(intra_k=1.5, intra_abs=3.0, disp_k=3, disp_floor_k=0.0),
     ),
 ]
 
