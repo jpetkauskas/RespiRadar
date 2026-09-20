@@ -59,10 +59,19 @@ class LiveDetector:
         detector,
         buffer_s: float = BUFFER_S,
         evaluate_every_s: float | None = EVALUATE_EVERY_S,
+        fit_now: bool = True,
     ) -> None:
         self.config = config
-        self.detector = fit_on_everything(detector)
+        # The extractor is cheap and needs nothing on disk. Fitting is the slow half: it
+        # reads the feature cache, and building that cache from the recordings takes minutes
+        # on a Cortex-A53. `fit_now=False` lets a caller start consuming frames immediately
+        # and fit on another thread - which is not a nicety on a real sensor, because a
+        # process that is not calling `get_next()` is a process backing frames up on the wire.
         self.extractor = FeatureExtractor(config)
+        self.detector = detector
+        self.fitted = False
+        if fit_now:
+            self.fit()
         self.max_frames = int(buffer_s * config.frame_rate)
         # `None` means never evaluate from `process`. Re-running a detector over the buffer
         # costs O(n): measured on this corpus, a 300 s buffer takes ~1.9 s per evaluation on
@@ -95,6 +104,11 @@ class LiveDetector:
         self.alarms.append(self.alarm)
         return row
 
+    def fit(self) -> None:
+        """Fit the detector on every recording. Reads the feature cache, so it is the slow one."""
+        self.detector = fit_on_everything(self.detector)
+        self.fitted = True
+
     def evaluate(self, snapshot=None) -> bool:
         """Run the detector and return its current verdict.
 
@@ -105,6 +119,10 @@ class LiveDetector:
         return self._evaluate(snapshot)
 
     def _evaluate(self, snapshot=None) -> bool:
+        # An unfitted detector has no opinion worth having. Returning the current state means
+        # "no alarm yet" rather than a verdict from a detector that has not seen the data.
+        if not self.fitted:
+            return self.alarm
         times, rows = snapshot if snapshot is not None else (self.times, self.rows)
         if len(times) <= 40:
             return self.alarm

@@ -163,3 +163,63 @@ def test_warm_reports_how_provisional_the_row_is():
     assert warm[t < 8.0].max() < 1.0             # provisional while the buffers fill
     assert warm[t > 20.0].min() == 1.0           # settled once they have
     assert np.allclose(history, t + 1 / 20.0)    # one frame of history per frame seen
+
+
+# -- the feature cache is committed, so a stale one is everybody's problem ---
+
+
+def _write_cache(path, schema=None, features=None, sessions=None):
+    from respiradar.dataset import CACHE_SCHEMA, FEATURE_NAMES, SESSIONS
+
+    np.savez_compressed(
+        path,
+        __schema=np.array(CACHE_SCHEMA if schema is None else schema),
+        __features=np.array(FEATURE_NAMES if features is None else features),
+        __sessions=np.array([s.name for s in SESSIONS] if sessions is None else sessions),
+    )
+    return path
+
+
+def test_a_matching_cache_is_accepted(tmp_path):
+    from respiradar.dataset import cache_is_current
+
+    assert cache_is_current(_write_cache(tmp_path / "f.npz"))
+
+
+def test_a_cache_written_before_a_session_was_added_is_rejected(tmp_path):
+    """The real failure this replaces: a cache predating the `wall` session survived, and
+    surfaced as `KeyError: wall__t` thrown from inside a detector, a long way from the cause.
+    """
+    from respiradar.dataset import SESSIONS, cache_is_current
+
+    short = [s.name for s in SESSIONS][:-1]
+    assert not cache_is_current(_write_cache(tmp_path / "f.npz", sessions=short))
+
+
+def test_a_cache_from_a_different_feature_set_is_rejected(tmp_path):
+    from respiradar.dataset import FEATURE_NAMES, cache_is_current
+
+    assert not cache_is_current(_write_cache(tmp_path / "f.npz", features=FEATURE_NAMES[:-1]))
+
+
+def test_an_unstamped_or_unreadable_cache_is_rejected(tmp_path):
+    from respiradar.dataset import cache_is_current
+
+    assert not cache_is_current(tmp_path / "missing.npz")
+
+    unstamped = tmp_path / "old.npz"
+    np.savez_compressed(unstamped, sleeping__t=np.zeros(3))
+    assert not cache_is_current(unstamped)
+
+    corrupt = tmp_path / "corrupt.npz"
+    corrupt.write_bytes(b"not an npz at all")
+    assert not cache_is_current(corrupt)
+
+
+def test_the_committed_cache_matches_this_checkout():
+    """If this fails, rebuild and re-commit: python -m respiradar.dataset"""
+    from respiradar.dataset import CACHE, cache_is_current
+
+    if not CACHE.exists():
+        pytest.skip("no cache in this checkout")
+    assert cache_is_current(CACHE)

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 from collections import deque
 
 import numpy as np
@@ -90,8 +91,13 @@ class MatrixFeed:
 
             detector = build_best()
         # `evaluate_every_s=None`: the worker owns evaluation, `process` only extracts.
-        self.live = LiveDetector(config, detector, buffer_s=buffer_s, evaluate_every_s=None)
+        # `fit_now=False`: fitting reads the feature cache, and building that cache takes
+        # minutes on this board. The matrix lights up straight away and the apnea alarm
+        # arrives when the detector is ready, rather than the display staying dark.
+        self.live = LiveDetector(config, detector, buffer_s=buffer_s, evaluate_every_s=None,
+                                 fit_now=False)
         self.worker = AlarmWorker(self.live)
+        threading.Thread(target=self.live.fit, daemon=True).start()
         self.presence = PresenceTracker(config.frame_rate)
 
         nyq = config.frame_rate / 2
@@ -118,7 +124,9 @@ class MatrixFeed:
             wave_mm=float(value[0]),
             present=self.presence.present,
             alarm=self.worker.alarm,
-            settling=float(row[HISTORY]) < DEFAULT_WARMUP_S,
+            # Until the detector is fitted nothing can alarm, which is exactly what
+            # SETTLING already means: warming up, nothing decided yet.
+            settling=float(row[HISTORY]) < DEFAULT_WARMUP_S or not self.live.fitted,
             presence=activity / PRESENCE_THRESHOLD,
         )
 

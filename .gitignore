@@ -9,5 +9,12 @@ __pycache__/
 
 # Recorded training sessions (datalog.py)
 
-# derived feature cache, rebuilt with `python -m respiradar.dataset`
+# Derived caches, rebuilt on demand...
 data/*.npz
+
+# ...except the shared feature cache, which is committed. Rebuilding it from the recordings
+# takes minutes on the UNO Q, and every live path needs it before the detector can fit.
+# Rebuild and re-commit it whenever SESSIONS or FEATURE_NAMES change:
+#     python -m respiradar.dataset
+# `dataset.cache_is_current` checks both, so a stale one rebuilds itself rather than failing.
+!data/features.npz

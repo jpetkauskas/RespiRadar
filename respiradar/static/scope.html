@@ -247,7 +247,14 @@ function render(d){
   el('chest').textContent = d.chest_m.toFixed(2)+' m';
   el('amp').textContent = d.amp_mm.toFixed(2)+' mm';
   el('clock').textContent = d.t.toFixed(0)+' s';
-  el('source').textContent = d.source + ' · ' + d.status;
+  // The detector fits on its own thread; on a cold checkout that builds the feature cache
+  // and takes minutes. Everything else is live throughout, so say so rather than letting the
+  // alarm look broken.
+  let det = '';
+  if(d.detector === 'loading') det = ' · detector loading — no apnea alarm yet';
+  else if(d.detector && d.detector.startsWith('error')) det = ' · detector failed: '+d.detector;
+  el('source').textContent = d.source + ' · ' + d.status + det;
+  el('source').style.color = det ? C.warn : C.dim;
 
   bars(el('profile'), d.profile, d.distances_m, d.chest_bin, '#2b4a6f');
   drawIQ(el('iq'), d.iq);

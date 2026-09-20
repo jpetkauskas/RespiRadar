@@ -122,9 +122,16 @@ class ScopeFeed:
         self.frames = frames
         self.status = "starting"
         self.source = "?"
+        self.fit_error: str | None = None
 
+        # `fit_now=False`, then fit on its own thread: the HTTP server and the frame loop both
+        # start immediately, and the apnea alarm switches on when the detector is ready. On a
+        # cold checkout that fit builds the feature cache, which is minutes on the UNO Q -
+        # long enough that a synchronous version looks exactly like a hang, with nothing
+        # served and, on a real sensor, frames piling up on the wire the whole time.
         self.live = LiveDetector(
-            config, detector or build_best(), buffer_s=BUFFER_S, evaluate_every_s=None
+            config, detector or build_best(), buffer_s=BUFFER_S, evaluate_every_s=None,
+            fit_now=False,
         )
         self.worker = AlarmWorker(self.live)
 
@@ -148,7 +155,18 @@ class ScopeFeed:
         self.activity = 0.0
         self.settling = True
         self.lock = threading.Lock()
+        # Both threads start last, once every attribute they touch exists.
+        threading.Thread(target=self._fit, daemon=True).start()
         threading.Thread(target=self._run, daemon=True).start()
+
+    def _fit(self) -> None:
+        try:
+            self.live.fit()
+        except Exception as exc:
+            # No detector means no apnea alarm. The wave, the presence and every other panel
+            # are unaffected, so this must not take the scope down with it.
+            traceback.print_exc()
+            self.fit_error = str(exc)
 
     # -- acquisition ----------------------------------------------------
     def _run(self) -> None:
@@ -272,6 +290,8 @@ class ScopeFeed:
             "presence": round(activity / PRESENCE_THRESHOLD, 2),
             "amp_mm": round(amp, 3),
             "state": state,
+            "detector": ("error: " + self.fit_error) if self.fit_error
+                        else ("ready" if self.live.fitted else "loading"),
             "holds": self.holds,
             "window_s": HISTORY_S,
         }

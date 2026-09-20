@@ -145,6 +145,32 @@ sensor flagged as delayed — if that's above zero, the link is oversubscribed.
 
 If connecting hangs, try `--no-flow-control` (RTS/CTS support varies by USB-serial bridge).
 
+## The feature cache is committed
+
+`data/features.npz` holds one causal feature row per frame for every recording, and every
+live path needs it before a detector can fit. Building it from the `.h5` files takes ~40 s on
+a laptop and **several minutes on the UNO Q's A53s** — long enough that a first run there used
+to look like a hang, because it happened silently from inside `load_cached`.
+
+So it is committed, and `python -m respiradar.dataset` reports progress per session.
+
+**Rebuild and re-commit it whenever `SESSIONS` or `FEATURE_NAMES` changes:**
+
+```bash
+uv run python -m respiradar.dataset
+git add data/features.npz
+```
+
+`dataset.cache_is_current` stamps the schema, the feature list and the session list into the
+file and checks all three, so a cache that no longer matches the code rebuilds itself. It used
+to rebuild only when the file was *missing*, which is how a cache predating the `wall` session
+survived and surfaced as `KeyError: wall__t` from inside a detector.
+
+Nothing you look at waits on any of this. The web scope and the LED matrix start immediately
+and fit the detector on a background thread; the breathing wave and presence are live
+throughout, and the apnea alarm switches on when the detector is ready. The scope says
+`detector loading` while that is happening, and the matrix shows its warming-up lamp.
+
 ## The scope, over the network
 
 `visualize.py` needs a screen and PySide6. To watch the same eight panels from a phone, a

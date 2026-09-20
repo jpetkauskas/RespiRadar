@@ -144,3 +144,59 @@ def test_no_breathing_rate_is_invented_for_an_empty_room():
     assert payload["present"] is False
     assert payload["bpm"] is None
     assert payload["state"] == "no presence"
+
+
+# -- cold start ---------------------------------------------------------
+
+
+def test_the_feed_is_usable_before_the_detector_is_fitted():
+    """Fitting reads the feature cache, and building that cache takes minutes on the UNO Q.
+    Nothing the user looks at may wait on it: the server has to be listening and the frame
+    loop has to be consuming, or on a real sensor the frames pile up on the wire.
+    """
+    from respiradar.live import LiveDetector
+
+    config = RadarConfig(sweeps_per_frame=8)
+    live = LiveDetector(config, _NeverFits(), evaluate_every_s=None, fit_now=False)
+    assert live.fitted is False
+
+    frames = simulated_frames(config, breaths_per_min=14.0, realtime=False)
+    for frame in itertools.islice(frames, 200):
+        live.process(frame)
+
+    # It extracted happily, and refuses to produce a verdict it has no basis for.
+    assert len(live.rows) == 200
+    assert live.evaluate() is False
+    assert _NeverFits.asked is False
+
+
+def test_fitting_flips_the_flag_and_lets_verdicts_through():
+    """The other half: once fitted, the detector is actually consulted."""
+    from respiradar.live import LiveDetector
+
+    config = RadarConfig(sweeps_per_frame=8)
+    live = LiveDetector(config, _NeverFits(), evaluate_every_s=None, fit_now=False)
+    frames = simulated_frames(config, breaths_per_min=14.0, realtime=False)
+    for frame in itertools.islice(frames, 200):
+        live.process(frame)
+
+    assert _NeverFits.asked is False  # still unfitted: not consulted
+    live.fit()
+    assert live.fitted is True
+    live.evaluate()
+    assert _NeverFits.asked is True
+
+
+class _NeverFits:
+    """A detector with no `fit`, so `fit_on_everything` returns it untouched and no cache is
+    read. `asked` records whether anything ever called `predict`."""
+
+    name = "test/never-fits"
+    asked = False
+
+    def __init__(self):
+        type(self).asked = False  # class state, so each test starts from a known place
+
+    def predict(self, clip):
+        type(self).asked = True
+        return np.zeros(len(clip.t), dtype=bool)

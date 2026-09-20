@@ -12,6 +12,7 @@ the two holds' start and end.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -496,22 +497,70 @@ def extract_session(
 CACHE = DATA / "features.npz"
 
 
-def build_cache(path: Path = CACHE) -> Path:
-    """Extract every session once and save it. Feature extraction is the slow part."""
-    arrays = {}
-    for session in SESSIONS:
+# Bump when anything changes the meaning of a cached row: the feature list, the extractor's
+# behaviour, or the label clock. The cache is committed, so a stale one is not one developer's
+# problem - it is everybody's.
+CACHE_SCHEMA = 1
+
+
+def build_cache(path: Path = CACHE, verbose: bool = True) -> Path:
+    """Extract every session once and save it. Feature extraction is the slow part.
+
+    Tens of seconds on a laptop and several minutes on a Cortex-A53, and it is reached from
+    inside `load_cached` - so when it ran silently, starting the app on the UNO Q was
+    indistinguishable from a hang. It says what it is doing.
+    """
+    names = [session.name for session in SESSIONS]
+    arrays = {
+        "__schema": np.array(CACHE_SCHEMA),
+        "__features": np.array(FEATURE_NAMES),
+        "__sessions": np.array(names),
+    }
+    started = time.monotonic()
+    if verbose:
+        print(f"building the feature cache: {len(SESSIONS)} sessions", flush=True)
+    for i, session in enumerate(SESSIONS, 1):
+        mark = time.monotonic()
         t, X, y = extract_session(session)
         arrays[f"{session.name}__t"] = t
         arrays[f"{session.name}__X"] = X
         arrays[f"{session.name}__y"] = y
+        if verbose:
+            print(f"  [{i:2d}/{len(SESSIONS)}] {session.name:<22} "
+                  f"{time.monotonic() - mark:5.1f}s", flush=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, **arrays)
+    if verbose:
+        print(f"wrote {path} in {time.monotonic() - started:.0f}s", flush=True)
     return path
 
 
-def load_cached(name: str, path: Path = CACHE):
-    """(times, features, labels) for one session, building the cache on first use."""
+def cache_is_current(path: Path = CACHE) -> bool:
+    """Does this cache match the code about to read it?
+
+    `load_cached` used to rebuild only when the file was MISSING. A cache written before the
+    `wall` session was added therefore survived, and surfaced as `KeyError: wall__t` thrown
+    from deep inside a detector - a confusing failure a long way from its cause. Now that the
+    cache is committed, that same stale file would be distributed to everyone, so the check
+    covers the session list and the feature list, not just the file's existence.
+    """
     if not path.exists():
+        return False
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            return (
+                "__schema" in data
+                and int(data["__schema"]) == CACHE_SCHEMA
+                and list(data["__features"]) == FEATURE_NAMES
+                and list(data["__sessions"]) == [s.name for s in SESSIONS]
+            )
+    except Exception:
+        return False  # unreadable, truncated, written by another numpy - rebuild it
+
+
+def load_cached(name: str, path: Path = CACHE):
+    """(times, features, labels) for one session, rebuilding the cache if it is stale."""
+    if not cache_is_current(path):
         build_cache(path)
     with np.load(path) as data:
         return data[f"{name}__t"], data[f"{name}__X"], data[f"{name}__y"]
