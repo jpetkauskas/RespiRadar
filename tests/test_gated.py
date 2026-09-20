@@ -75,7 +75,15 @@ def test_the_shipped_detector_is_not_obviously_broken(bakeoff_score):
     result = bakeoff_score(build_best())
 
     assert result.detected > result.total_holds / 2
-    assert result.false_alarms <= 3
+    # Raised from 3 to 5 when `disp_k` was doubled, deliberately and with the cost measured.
+    # Holding your breath raises `disp_std_4s` rather than lowering it, so the old gate
+    # wiped the charts a third of the way through every hold on the demo rig and the alarm
+    # covered 67% of it in flickering chunks. Doubling the gate takes that to 100% and costs
+    # four false alarms over 26 minutes where zero was possible. That is a real regression on
+    # negatives, recorded here rather than hidden: an alarm that flickers through a genuine
+    # apnea is useless to whoever is watching, and this bound exists to catch a detector that
+    # has stopped working, not to freeze a tuning decision.
+    assert result.false_alarms <= 5
 
 
 def test_the_best_detector_also_stays_quiet_in_an_empty_room(empty_room_clip):
