@@ -58,6 +58,23 @@ class RadarConfig:
         return self.bits_per_second <= 0.8 * baudrate
 
 
+# Legacy module-level view of the default config. `ml_pipeline.py` reads these, so they stay.
+# Prefer a RadarConfig instance in new code: these settings are per-session, since main.py
+# lowers the frame rate and sweep count to fit the available baud rate.
+_DEFAULT_CONFIG = RadarConfig()
+START_M = _DEFAULT_CONFIG.start_m
+END_M = _DEFAULT_CONFIG.end_m
+STEP_LENGTH = _DEFAULT_CONFIG.step_length
+FRAME_RATE_HZ = _DEFAULT_CONFIG.frame_rate
+SWEEPS_PER_FRAME = _DEFAULT_CONFIG.sweeps_per_frame
+HWAAS = _DEFAULT_CONFIG.hwaas
+
+
+def _points() -> tuple[int, int]:
+    """(start_point, num_points) for the default range. Kept for `ml_pipeline.py`."""
+    return _DEFAULT_CONFIG.start_point, _DEFAULT_CONFIG.num_points
+
+
 @dataclass
 class Frame:
     t: float  # seconds since the source started

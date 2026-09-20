@@ -25,3 +25,11 @@ def no_presence_processor_recording() -> Path:
 def acconeer_reference() -> Path:
     """Acconeer's own per-frame results for `sitting_recording`."""
     return DATA / "breathing-sitting-controller.h5"
+
+
+@pytest.fixture(scope="session")
+def sleeping_session():
+    """Extracted features for one session. Slow, so computed once per test session."""
+    from respiradar.dataset import extract_session, session_by_name
+
+    return extract_session(session_by_name("sleeping"))
