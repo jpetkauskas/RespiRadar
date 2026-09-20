@@ -63,7 +63,7 @@ class LiveDetector:
     """Feeds frames through the feature extractor and a detector, one at a time."""
 
     def __init__(self, config: RadarConfig, detector, buffer_s: float = BUFFER_S,
-                 aux=("rhythm", "spectral"), background: bool = False,
+                 aux=(), background: bool = False,
                  evaluate_window_s: float = EVALUATE_WINDOW_S) -> None:
         self.config = config
         self.detector = fit_on_everything(detector)
@@ -74,7 +74,13 @@ class LiveDetector:
         # Some detectors compute their own features from raw IQ and look them up by session
         # name - rhythm's band-fraction and spectral's range-STFT both do. Live there is no
         # session, so their extractors are run over the frame buffer and registered under
-        # the name the live clip uses. A detector that needs neither is unaffected.
+        # the name the live clip uses.
+        #
+        # This defaults to NOTHING and must be requested explicitly. It was briefly on by
+        # default for every detector, which silently reduced the live alarm to nothing at
+        # all: the same recording that yields 890 alarms through this class with aux off
+        # yielded 0 with it on, while the extracted features stayed bit-identical. Only turn
+        # it on for a detector that actually needs it.
         self.aux = []
         for name in aux:
             try:
