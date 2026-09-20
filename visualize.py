@@ -357,8 +357,21 @@ class Scope(QtWidgets.QMainWindow):
         self.p_spec.addItem(self.spec_peak)
 
         # 8. detector ------------------------------------------------------
-        self.p_det = self._panel(2, 1, "8 - DETECTOR: green = real hold, red = alarm",
-                                 "", "time (s)", colspan=2)
+        # 9. the presence gate, made visible -------------------------------
+        self.p_gate = self._panel(2, 1, "9 - PRESENCE GATE: alarms are vetoed below the line",
+                                  "slow-motion score", "time (s)")
+        self.c_gate_raw = self.p_gate.plot(pen=pg.mkPen("#8b949e", width=1))
+        self.c_gate_med = self.p_gate.plot(pen=pg.mkPen(ACCENT, width=2))
+        thr = pg.InfiniteLine(angle=0, pos=PRESENCE_THRESHOLD,
+                              pen=pg.mkPen(BAD, width=2, style=QtCore.Qt.DashLine))
+        self.p_gate.addItem(thr)
+        self.gate_veto = pg.LinearRegionItem(movable=False, brush=pg.mkBrush(248, 81, 73, 45))
+        self.gate_veto.setZValue(-10)
+        self.p_gate.addItem(self.gate_veto)
+        self.gate_veto.hide()
+
+        self.p_det = self._panel(2, 2, "8 - DETECTOR: green = real hold, red = alarm",
+                                 "", "time (s)")
         self.p_det.setYRange(0, 1)
         self.p_det.getAxis("left").setTicks([])
         self.c_det = self.p_det.plot(pen=pg.mkPen(BAD, width=2))
@@ -461,6 +474,22 @@ class Scope(QtWidgets.QMainWindow):
                 self.spec_peak.show()
             else:
                 self.spec_peak.hide()
+
+        # Panel 9: the raw slow-motion score, its 60 s trailing median (what the gate
+        # actually tests) and the threshold. When the blue line dips under the red dashes the
+        # gate concludes nobody is there and silently cancels any alarm - so if the detector
+        # looks like it should fire and does not, this is the panel that says why.
+        inter_win = inter[lo : i + 1]
+        self.c_gate_raw.setData(t[lo : i + 1], inter_win)
+        med_win = np.array([
+            np.median(inter[max(0, j - window + 1) : j + 1]) for j in range(lo, i + 1, 5)
+        ])
+        self.c_gate_med.setData(t[lo : i + 1 : 5][: len(med_win)], med_win)
+        if not present:
+            self.gate_veto.setRegion((t[lo], t[i]))
+            self.gate_veto.show()
+        else:
+            self.gate_veto.hide()
 
         self.c_det.setData(t[lo : i + 1], d["alarms"][lo : i + 1].astype(float))
         self.now_line.setPos(t[i])
