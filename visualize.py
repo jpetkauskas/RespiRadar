@@ -94,15 +94,55 @@ BAD = "#f85149"
 DIM = "#30363d"
 
 
+SNR_GOOD = 7.0       # what the demo-rig run that scored 30/30 measured at the chest
+SNR_POOR = 3.0       # below this the chest tracker starts winning on noise instead
+SNR_NEAR_FIELD_M = 0.5
+
+
+def body_snr(amp: np.ndarray, noise: np.ndarray, distances: np.ndarray):
+    """Strongest reflection-to-noise ratio beyond the near field, and where it is.
+
+    The single number that predicted whether a live run worked. Across three demo-rig
+    recordings taken at the same distance with an identical sensor config, the chest SNR
+    read 7.2, 4.0 and 2.8 - and only the first detected a breath hold. Below about 3 the
+    chest-bin tracker starts preferring empty bins, because phase noise converts to apparent
+    millimetres in inverse proportion to SNR, and noise never stops moving. Putting it on
+    screen is what lets you fix that before recording rather than after.
+    """
+    snr = amp / np.maximum(noise, 1e-9)
+    far = distances > SNR_NEAR_FIELD_M
+    if not far.any():
+        return 0.0, 0.0
+    j = int(np.argmax(np.where(far, snr, 0.0)))
+    return float(snr[j]), float(distances[j])
+
+
+def sweep_noise(iq: np.ndarray) -> np.ndarray:
+    """Per-bin noise floor: the chest cannot move in the ~1 ms between sweeps."""
+    if iq.shape[0] < 2:
+        return np.ones(iq.shape[1])
+    return np.abs(np.diff(iq, axis=0)).mean(axis=0) / np.sqrt(2)
+
+
 def extract(session, detector_name: str = "gated"):
     """Run the pipeline once, keeping every intermediate the panels need."""
     config = recorded_config(session.path)
     ex = FeatureExtractor(config)
 
     times, profiles, chest_iq, bins, raw_mm, feats, bin_motion = [], [], [], [], [], [], []
+    snrs, snr_ms = [], []
+    amp_ema = noise_ema = None
     for frame in replay_frames(session.path):
         row = ex.process(frame)
         mean_sweep = frame.iq.mean(axis=0)
+        amp, noise = np.abs(mean_sweep), sweep_noise(frame.iq)
+        if amp_ema is None:
+            amp_ema, noise_ema = amp, noise
+        else:
+            amp_ema = 0.95 * amp_ema + 0.05 * amp
+            noise_ema = 0.95 * noise_ema + 0.05 * noise
+        v, m = body_snr(amp_ema, noise_ema, config.distances_m)
+        snrs.append(v); snr_ms.append(m)
         times.append(frame.t)
         profiles.append(np.abs(mean_sweep))
         bins.append(ex._last_bin)
@@ -123,6 +163,8 @@ def extract(session, detector_name: str = "gated"):
         raw_mm=np.asarray(raw_mm),
         features=np.asarray(feats),
         bin_motion=np.asarray(bin_motion),
+        snr=np.asarray(snrs),
+        snr_m=np.asarray(snr_ms),
         fs=config.frame_rate,
         holds=session.holds,
     )
@@ -207,6 +249,8 @@ class LiveSource:
         self.holds = []
         self.error = None
 
+        self._snr, self._snr_m = [], []
+        self._amp_ema = self._noise_ema = None
         self._t, self._profile, self._iq = [], [], []
         self._bins, self._raw, self._feat, self._motion, self._alarm = [], [], [], [], []
 
@@ -271,6 +315,14 @@ class LiveSource:
                 row = self.live.process(frame)
                 mean_sweep = frame.iq.mean(axis=0)
                 ex = self.live.extractor
+                amp, noise = np.abs(mean_sweep), sweep_noise(frame.iq)
+                if self._amp_ema is None:
+                    self._amp_ema, self._noise_ema = amp, noise
+                else:
+                    self._amp_ema = 0.95 * self._amp_ema + 0.05 * amp
+                    self._noise_ema = 0.95 * self._noise_ema + 0.05 * noise
+                v, m = body_snr(self._amp_ema, self._noise_ema, self.distances)
+                self._snr.append(v); self._snr_m.append(m)
                 self._t.append(frame.t)
                 self._profile.append(np.abs(mean_sweep))
                 self._bins.append(ex._last_bin)
@@ -310,13 +362,14 @@ class LiveSource:
         """
         return min(len(a) for a in (self._t, self._profile, self._iq, self._bins,
                                     self._raw, self._feat, self._motion, self._wave,
-                                    self._alarm))
+                                    self._alarm, self._snr, self._snr_m))
 
     def __getitem__(self, key):
         arrays = {
             "t": self._t, "profile": self._profile, "chest_iq": self._iq,
             "bin_index": self._bins, "raw_mm": self._raw, "features": self._feat,
             "bin_motion": self._motion, "wave": self._wave, "alarms": self._alarm,
+            "snr": self._snr, "snr_m": self._snr_m,
         }
         if key in arrays:
             return np.asarray(arrays[key])
@@ -361,6 +414,7 @@ class Scope(QtWidgets.QMainWindow):
             ("bpm", "BREATHING RATE"),
             ("chest", "CHEST AT"),
             ("amp", "CHEST MOTION"),
+            ("snr", "BODY SNR"),
             ("presence", "PRESENCE"),
             ("rate", "FRAME RATE"),
             ("gate", "CHART GATE"),
@@ -734,6 +788,17 @@ class Scope(QtWidgets.QMainWindow):
                 measured = (min(i, 200)) / span
         expected = fs
         bad = measured > 0 and abs(measured - expected) / expected > 0.15
+        # BODY SNR: how strongly the strongest thing beyond the near field reflects,
+        # against its own noise floor. Adjust position and covering to maximise this BEFORE
+        # recording - three demo-rig runs at the same distance read 7.2, 4.0 and 2.8, and
+        # only the 7.2 one detected a breath hold.
+        snr_v = float(d["snr"][i]) if len(d["snr"]) > i else 0.0
+        snr_m = float(d["snr_m"][i]) if len(d["snr_m"]) > i else 0.0
+        snr_col = GOOD if snr_v >= SNR_GOOD else (WARN if snr_v >= SNR_POOR else BAD)
+        self.readouts["snr"].setText("--" if not snr_v else f"{snr_v:.1f} @ {snr_m:.2f}m")
+        self.readouts["snr"].setStyleSheet(
+            f"font-size:30px; font-weight:600; color:{snr_col};")
+
         self.readouts["rate"].setText(f"{measured:.1f} Hz" if measured else "--")
         self.readouts["rate"].setStyleSheet(
             f"font-size:30px; font-weight:600; color:{BAD if bad else GOOD};")
