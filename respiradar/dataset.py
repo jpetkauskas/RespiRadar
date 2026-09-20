@@ -80,6 +80,13 @@ SESSIONS: list[Session] = [
     Session("justinas-holds-3515", "justinas_breath-hold_20260919-203515.h5", "justinas",
             holds=[Episode(30.2, 60.1), Episode(90.0, 120.2), Episode(151.9, 180.2)],
             description="scripted 30 s hold x 3"),
+    # An empty scene - the sensor pointed at a wall, nobody in the beam. Every other
+    # recording contains a person throughout, so until this existed the "does it alarm at an
+    # empty room" question was answered only by a simulator, which turned out to understate
+    # real clutter badly: simulated presence scores peak at 1.5, this wall reaches 15.2.
+    # It is its own subject so leave-one-subject-out gives it a fold of its own.
+    Session("wall", "wall_static_20260919-212928.h5", "wall",
+            description="pointed at a wall, nobody there - must never alarm"),
 ]
 
 

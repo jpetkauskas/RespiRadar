@@ -65,6 +65,7 @@ from respiradar.dataset import (
     FeatureExtractor,
     session_by_name,
 )
+from respiradar.detectors.gated import PRESENCE_THRESHOLD, PRESENCE_WINDOW_S
 from respiradar.sources import BASE_STEP_M, recorded_config, replay_frames
 
 WINDOW_S = 30.0          # how much history the time plots show
@@ -262,6 +263,7 @@ class Scope(QtWidgets.QMainWindow):
             ("bpm", "BREATHING RATE"),
             ("chest", "CHEST AT"),
             ("amp", "CHEST MOTION"),
+            ("presence", "PRESENCE"),
             ("state", "STATUS"),
         ]:
             box = QtWidgets.QVBoxLayout()
@@ -456,17 +458,34 @@ class Scope(QtWidgets.QMainWindow):
         self.c_det.setData(t[lo : i + 1], d["alarms"][lo : i + 1].astype(float))
         self.now_line.setPos(t[i])
 
+        # Is anyone actually there? The same slow statistic the detector's gate uses: a
+        # 60 s trailing median of the slow-motion score. Per-frame values cannot tell a
+        # still person from a wall, and without this check the panels happily report a
+        # breathing rate for an empty room - the largest peak in a band of noise is still
+        # a peak.
+        inter = d["features"][:, FEATURE_NAMES.index("inter")]
+        window = int(PRESENCE_WINDOW_S * fs)
+        present = float(np.median(inter[max(0, i - window + 1) : i + 1])) >= PRESENCE_THRESHOLD
+
         in_hold = any(h.start_s <= t[i] < h.end_s for h in d["holds"])
-        alarming = bool(d["alarms"][i])
+        alarming = bool(d["alarms"][i]) and present
         amp = float(np.std(d["wave"][max(0, i - int(4 * fs)) : i + 1])) if i > 10 else 0.0
 
+        if not present:
+            bpm = None
         self.readouts["bpm"].setText("--" if bpm is None else f"{bpm:.1f}")
+        self.readouts["presence"].setText("nobody" if not present else "person")
+        self.readouts["presence"].setStyleSheet(
+            f"font-size:30px; font-weight:600; color:{'#8b949e' if not present else GOOD};")
         self.readouts["bpm"].setStyleSheet(
             "font-size:30px; font-weight:600;" if bpm is not None
             else "font-size:30px; font-weight:600; color:#8b949e;")
         self.readouts["chest"].setText(f"{chest_m:.2f} m")
         self.readouts["amp"].setText(f"{amp:.2f} mm")
-        if bpm is None and not alarming:
+        if not present:
+            self.readouts["state"].setText("no presence")
+            colour = "#8b949e"
+        elif bpm is None and not alarming:
             self.readouts["state"].setText("no breathing signal")
             colour = "#8b949e"
         elif alarming:

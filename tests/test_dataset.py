@@ -66,7 +66,9 @@ def test_ratio_features_never_explode():
 def test_every_subject_is_represented():
     from respiradar.dataset import subjects
 
-    assert subjects() == ["justinas", "nishant", "vishnu"]
+    # "wall" is an empty scene rather than a person, and is deliberately its own subject so
+    # leave-one-subject-out gives empty-room rejection a fold of its own.
+    assert subjects() == ["justinas", "nishant", "vishnu", "wall"]
 
 
 def test_folds_never_train_on_the_subject_they_test():
